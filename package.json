@@ -1,0 +1,31 @@
+{
+  "name": "supabase-model-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon app.js",
+    "build": "echo 'No build step'",
+    "start": "nodemon app.js",
+    "db:push": "drizzle-kit push",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node migrate.js",
+    "db:studio": "drizzle-kit studio",
+    "migrate:mongo": "node scripts/migrate-mongo-to-pg.js",
+    "backup": "node backup/export-tables.js",
+    "restore": "node backup/restore-tables.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "bson": "^7.2.0",
+    "dotenv": "^16.4.5",
+    "drizzle-orm": "^0.36.0",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "postgres": "^3.4.4",
+    "uuidv7": "^1.1.0"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.28.0",
+    "nodemon": "^3.1.14"
+  }
+}
