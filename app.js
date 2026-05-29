@@ -17,6 +17,10 @@ import billRoutes from "./routes/billRoutes.js";
 import aboutUsRoutes from "./routes/aboutUsRoutes.js";
 import commentRoutes from "./routes/commentRoutes.js";
 
+// v3 module (merged from BE 2 — self-contained under ./v3/*)
+import v3Routes from "./v3/routes/v3Routes.js";
+import { ensureTables as ensureV3Tables } from "./v3/db/ensureTables.js";
+
 const app = express();
 
 // Body parsing with high limit for large template payloads (match BE).
@@ -34,7 +38,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, X-Client-Id");
   res.setHeader("Access-Control-Expose-Headers", "Content-Range, X-Content-Range");
   if (req.method === "OPTIONS") {
     res.status(204).end();
@@ -70,6 +74,7 @@ app.use("/contact", contactRoutes);
 app.use("/bill", billRoutes);
 app.use("/aboutus", aboutUsRoutes);
 app.use("/comments", commentRoutes);
+app.use("/v3", v3Routes);
 
 // Error handling
 app.use((err, req, res, next) => {
@@ -84,6 +89,15 @@ if (!process.env.VERCEL) {
     await db.execute(sql`SELECT 1`);
     console.log("Supabase connection successful");
     await ensureTables();
+    // v3 tables live in the schema defined by DB_SCHEMA (defaults to "prod"
+    // inside the v3 module). Failing to create them shouldn't take the
+    // legacy BE down, so we log and continue.
+    try {
+      await ensureV3Tables();
+      console.log("v3 tables ensured");
+    } catch (e) {
+      console.error("[ensureV3Tables] failed:", e.message);
+    }
   } catch (err) {
     console.error("Supabase connection failed:", err);
     process.exit(1);

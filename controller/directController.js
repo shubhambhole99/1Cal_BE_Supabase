@@ -146,17 +146,17 @@ function toDirectResponseWithTemplate(row) {
   const base = toDirectResponse(direct);
   base.templateId =
     row.templateId &&
-    (templateName != null ||
-      templateScheme != null ||
-      templateRulebook != null ||
-      templateDescription != null)
+      (templateName != null ||
+        templateScheme != null ||
+        templateRulebook != null ||
+        templateDescription != null)
       ? {
-          _id: row.templateId,
-          name: templateName ?? null,
-          scheme: templateScheme ?? null,
-          rulebook: templateRulebook ?? null,
-          description: templateDescription ?? null,
-        }
+        _id: row.templateId,
+        name: templateName ?? null,
+        scheme: templateScheme ?? null,
+        rulebook: templateRulebook ?? null,
+        description: templateDescription ?? null,
+      }
       : row.templateId;
   base.templateName = templateName ?? null;
   base.TemplateName = templateName ?? null;
@@ -174,6 +174,12 @@ export async function cloneFullTemplate(req, res) {
     const [original] = await db.select().from(templates).where(eq(templates.id, templateId)).limit(1);
     if (!original) return res.status(404).json({ message: "Template not found" });
 
+    // Explicit defaults — without these the row lands with `collaborators:
+    // null` and `created_at: null`, which crashes the report viewer's
+    // user-lookup (`data.collaborators.map(...)`) and renders "Created
+    // At: N/A". The schema declares JSONB defaults but they aren't
+    // firing on insert through this path.
+    const now = new Date();
     const [clone] = await db
       .insert(directFeasibilities)
       .values({
@@ -182,6 +188,8 @@ export async function cloneFullTemplate(req, res) {
         masterinput: original.masterinput || [],
         name: original.name,
         userid: userid || null,
+        collaborators: [],
+        createdAt: now,
       })
       .returning();
     return res.status(201).json(toDirectResponse(clone));
@@ -394,22 +402,22 @@ export async function getFormulaTemplateById(req, res) {
           const val =
             matched?.value != null && matched?.value !== ""
               ? matched.value
-              : importRef.importedMasterInputs?.[0]?.overrideValue!= null && importRef.importedMasterInputs[0].overrideValue !== ""
+              : importRef.importedMasterInputs?.[0]?.overrideValue != null && importRef.importedMasterInputs[0].overrideValue !== ""
                 ? importRef.importedMasterInputs[0].overrideValue
                 : importedRow.value;
-          const templateValue = importRef.importedMasterInputs?.[0]?.overrideValue!= null && importRef.importedMasterInputs[0].overrideValue !== ""
-          ? importRef.importedMasterInputs[0].overrideValue
-          : importedRow.value;
+          const templateValue = importRef.importedMasterInputs?.[0]?.overrideValue != null && importRef.importedMasterInputs[0].overrideValue !== ""
+            ? importRef.importedMasterInputs[0].overrideValue
+            : importedRow.value;
           const displayName = importRef.importedMasterInputs?.[0]?.overrideDisplayValue != null && importRef.importedMasterInputs[0].overrideDisplayValue !== ""
             ? importRef.importedMasterInputs[0].overrideDisplayValue
             : importedRow.displayName;
-         
+
           mergedMasterInput.push({
             ...importedRow,
             value: val,
             displayName,
             hidden: importedRow.hidden || importRef.importedMasterInputs?.[0]?.hidden,
-            templateValue: templateValue 
+            templateValue: templateValue
           });
         }
       } catch (e) {
