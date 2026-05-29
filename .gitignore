@@ -8,3 +8,4 @@ scripts/
 .env
 v3/.active-context.json
 
+.vercel
