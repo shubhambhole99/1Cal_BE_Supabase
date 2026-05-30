@@ -934,14 +934,18 @@ export async function createVersion(req, res) {
         //    The id mapping is built in-SQL via a deterministic hash on
         //    (group_id, new_version_id) so the parent_group_id remap can
         //    target the same generated id without a round-trip.
+        //    `$1::text` cast on every use of $1 inside digest() — without
+        //    it Postgres tries to infer $1 as VARCHAR (from the INSERT
+        //    column type) AND as text (from the `||` concat) and bails
+        //    with "inconsistent types deduced for parameter $1".
         await tx.unsafe(
           `INSERT INTO ${T.master_input_group}
              (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
            SELECT
-             substr(encode(digest($1 || g.id, 'sha256'), 'hex'), 1, 24),
-             g.template_id, $1, g.key, g.display_name, g.section, g.ord,
+             substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
+             g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
              CASE WHEN g.parent_group_id IS NULL THEN NULL
-                  ELSE substr(encode(digest($1 || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
+                  ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
              END
            FROM ${T.master_input_group} g
            WHERE g.template_id = $2 AND g.version_id = $3`,
@@ -956,10 +960,10 @@ export async function createVersion(req, res) {
               section, ord, display_name, kind, group_id)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
-             m.template_id, $1, m.key, m.value, m.ref, m.type, m.options,
+             m.template_id, $1::text, m.key, m.value, m.ref, m.type, m.options,
              m.section, m.ord, m.display_name, m.kind,
              CASE WHEN m.group_id IS NULL THEN NULL
-                  ELSE substr(encode(digest($1 || m.group_id, 'sha256'), 'hex'), 1, 24)
+                  ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
              END
            FROM ${T.master_input} m
            WHERE m.template_id = $2 AND m.version_id = $3`,
