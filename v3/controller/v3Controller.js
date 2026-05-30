@@ -1,16 +1,12 @@
 import { getSql } from "../db/index.js";
 import { newObjectId } from "../utils/objectId.js";
 import { convertLegacyPage, convertLegacyMasterInputs } from "../lib/legacyToV3.js";
-import { readFile, writeFile, mkdir } from "fs/promises";
-import { dirname, resolve as resolvePath } from "path";
-import { fileURLToPath } from "url";
 import { broadcast } from "../lib/events.js";
 
-const ACTIVE_CONTEXT_PATH = resolvePath(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  ".active-context.json",
-);
+// Active editing context used to live in BE/v3/.active-context.json. That
+// file path doesn't work on Vercel (read-only fs), so the active-context
+// handlers below now use the `active_context` DB singleton instead. The
+// fs/promises + path imports that the JSON variant needed are gone.
 
 const SCHEMA = process.env.DB_SCHEMA ?? "prod";
 const T = {
@@ -23,6 +19,8 @@ const T = {
   v3_versions: `"${SCHEMA}"."v3_versions"`,
   v3_vdiffs: `"${SCHEMA}"."v3_version_diffs"`,
   v3_calculations: `"${SCHEMA}"."v3_calculations"`,
+  projects: `"${SCHEMA}"."projects"`,
+  active_context: `"${SCHEMA}"."active_context"`,
   legacy_templates: `"${SCHEMA}"."templates"`,
 };
 
@@ -1695,20 +1693,26 @@ export async function patchInstanceMasterInput(req, res) {
 // ── GET /v3/active-context ────────────────────────────────────────────────────
 // Returns whatever the FE last reported as the user's active editing context.
 // Used by the feasibility MCP server so the agent knows which template/page is
-// currently open without the user having to spell it out.
+// currently open without the user having to spell it out. DB-backed singleton
+// row (id='current') so it survives across Vercel cold starts and serverless
+// instances (the previous file-based store didn't work on read-only fs).
 export async function getActiveContext(_req, res) {
   try {
-    const buf = await readFile(ACTIVE_CONTEXT_PATH, "utf8");
-    res.json(JSON.parse(buf));
+    const sql = getSql();
+    const [row] = await sql.unsafe(
+      `SELECT payload FROM ${T.active_context} WHERE id = 'current' LIMIT 1`,
+    );
+    if (!row) return res.json({ active: false });
+    res.json(row.payload);
   } catch (e) {
-    if (e.code === "ENOENT") return res.json({ active: false });
     res.status(500).json({ error: String(e.message || e) });
   }
 }
 
 // ── POST /v3/active-context ───────────────────────────────────────────────────
 // FE heartbeat: writes the current template/page selection so the MCP server
-// (and any other consumer) can read it back.
+// (and any other consumer) can read it back. Single upsert into the
+// `active_context` singleton row (id='current').
 export async function setActiveContext(req, res) {
   try {
     const b = req.body || {};
@@ -1724,8 +1728,14 @@ export async function setActiveContext(req, res) {
       selectionFocus: b.selectionFocus ?? null,
       updatedAt: new Date().toISOString(),
     };
-    await mkdir(dirname(ACTIVE_CONTEXT_PATH), { recursive: true });
-    await writeFile(ACTIVE_CONTEXT_PATH, JSON.stringify(payload, null, 2), "utf8");
+    const sql = getSql();
+    await sql.unsafe(
+      `INSERT INTO ${T.active_context} (id, payload, updated_at)
+       VALUES ('current', $1::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE
+         SET payload = EXCLUDED.payload, updated_at = NOW()`,
+      [JSON.stringify(payload)],
+    );
     res.json(payload);
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });

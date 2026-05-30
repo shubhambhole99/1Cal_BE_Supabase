@@ -3,3 +3,15 @@ drizzle/
 .env
 .env.*
 *.local
+backup/
+dist/
+BE.rar
+AGENT_WORKFLOW_PLAN.md
+CHAT_LOGGING_AND_DEV_MODE.md
+TESTTEMPLATE4_CHAT_EXECUTION_PLAN.md
+IMPORT_EXCEL_SPEC.md
+CREATE_USERS.md
+migrate-to-test.js
+.claude/
+v3/.active-context.json
+.vercel/

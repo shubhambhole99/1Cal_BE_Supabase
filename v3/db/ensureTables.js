@@ -278,6 +278,29 @@ export async function ensureTables() {
     await sql.unsafe(`ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS ord INTEGER NOT NULL DEFAULT 0`);
     await sql.unsafe(`ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT FALSE`);
 
+    // Projects — minimal placeholder for the upcoming MCGM-map → feasibility
+    // integration. Will likely grow (ward/village/CTS/geometry); for now we
+    // just want the id ↔ name handle so other tables can FK to it.
+    // Lives under the `projects` name (no v3_ prefix) by user preference.
+    // Back-compat: if an older v3_projects table exists, rename it before
+    // running CREATE so we don't end up with two tables.
+    await sql.unsafe(`ALTER TABLE IF EXISTS ${ref("v3_projects")} RENAME TO "projects"`);
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("projects")} (
+      id   VARCHAR(24) PRIMARY KEY,
+      name TEXT NOT NULL
+    )`);
+
+    // Active editing context — what template / page / cell the user has open
+    // in retemplate1 right now. Was a JSON file under BE/v3/.active-context.json,
+    // which doesn't work on Vercel (read-only fs). Now a DB-backed singleton:
+    // one row keyed by 'current'. The MCP server polls /v3/active-context to
+    // know what the user is editing.
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("active_context")} (
+      id         TEXT PRIMARY KEY,
+      payload    JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+
     // ── 2. Migrate existing schema if upgrading ─────────────────────────
     // 2a. Promote legacy table names to v3_master_input (preserves data).
     //   v3_template_master_input → master_input → v3_master_input
