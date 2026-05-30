@@ -902,77 +902,69 @@ export async function createVersion(req, res) {
           [newObjectId(), templateId, newVersionId, "Sheet1", 0, 50, 26],
         );
       } else if (sourceVersionId) {
-        const srcPages = await tx.unsafe(
-          `SELECT * FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2`,
-          [templateId, sourceVersionId],
-        );
-        for (const p of srcPages) {
-          await tx.unsafe(
-            `INSERT INTO ${T.v3_pages}
-               (id, template_id, version_id, name, ord, row_count, col_count, size,
-                orientation, scale, hidden, is_imported, columns_order, column_widths,
-                cells, styles, merges)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-            [
-              newObjectId(), templateId, newVersionId,
-              p.name, p.ord, p.row_count, p.col_count, p.size,
-              p.orientation, p.scale, p.hidden, p.is_imported,
-              p.columns_order, p.column_widths, p.cells, p.styles, p.merges,
-            ],
-          );
-        }
+        // Bulk-copy via single-statement SET-based inserts. The previous
+        // row-by-row loops did ~1000 sequential round-trips against the
+        // Supabase pooler — on Vercel with `maxDuration: 60s` that often
+        // timed out and the browser surfaced "Failed to fetch" on the
+        // Backup button. INSERT … SELECT keeps the data in Postgres so
+        // it's a single round-trip per table.
 
-        // Clone groups first so we can remap MI.group_id to the new group ids.
-        const srcGroups = await tx.unsafe(
-          `SELECT * FROM ${T.master_input_group}
-           WHERE template_id = $1 AND version_id = $2`,
-          [templateId, sourceVersionId],
+        // 1) Pages — copy every column except (id, version_id). Generate
+        //    a fresh id per row server-side via `gen_random_uuid()` mapped
+        //    to a 24-char hex (matches the newObjectId() shape — uses the
+        //    first 24 hex chars of a UUID v4 cast to text).
+        await tx.unsafe(
+          `INSERT INTO ${T.v3_pages}
+             (id, template_id, version_id, name, ord, row_count, col_count, size,
+              orientation, scale, hidden, is_imported, columns_order, column_widths,
+              row_heights, cells, styles, merges, schemes)
+           SELECT
+             substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
+             template_id, $1, name, ord, row_count, col_count, size,
+             orientation, scale, hidden, is_imported, columns_order, column_widths,
+             row_heights, cells, styles, merges, schemes
+           FROM ${T.v3_pages}
+           WHERE template_id = $2 AND version_id = $3`,
+          [newVersionId, templateId, sourceVersionId],
         );
-        const oldToNewGroupId = new Map();
-        for (const g of srcGroups) {
-          const newId = newObjectId();
-          oldToNewGroupId.set(g.id, newId);
-          await tx.unsafe(
-            `INSERT INTO ${T.master_input_group}
-               (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [
-              newId, templateId, newVersionId,
-              g.key, g.display_name, g.section, g.ord, null, // remap parent below
-            ],
-          );
-        }
-        // Second pass: remap parent_group_id now that all new ids exist.
-        for (const g of srcGroups) {
-          if (!g.parent_group_id) continue;
-          const newId = oldToNewGroupId.get(g.id);
-          const newParent = oldToNewGroupId.get(g.parent_group_id);
-          if (newId && newParent) {
-            await tx.unsafe(
-              `UPDATE ${T.master_input_group} SET parent_group_id = $1 WHERE id = $2`,
-              [newParent, newId],
-            );
-          }
-        }
 
-        const srcMIs = await tx.unsafe(
-          `SELECT * FROM ${T.master_input} WHERE template_id = $1 AND version_id = $2`,
-          [templateId, sourceVersionId],
+        // 2) Master-input groups — two passes still (we need a stable
+        //    old→new id map for both group_id on MIs and parent_group_id
+        //    on groups themselves), but each pass is now ONE statement.
+        //    The id mapping is built in-SQL via a deterministic hash on
+        //    (group_id, new_version_id) so the parent_group_id remap can
+        //    target the same generated id without a round-trip.
+        await tx.unsafe(
+          `INSERT INTO ${T.master_input_group}
+             (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+           SELECT
+             substr(encode(digest($1 || g.id, 'sha256'), 'hex'), 1, 24),
+             g.template_id, $1, g.key, g.display_name, g.section, g.ord,
+             CASE WHEN g.parent_group_id IS NULL THEN NULL
+                  ELSE substr(encode(digest($1 || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
+             END
+           FROM ${T.master_input_group} g
+           WHERE g.template_id = $2 AND g.version_id = $3`,
+          [newVersionId, templateId, sourceVersionId],
         );
-        for (const mi of srcMIs) {
-          await tx.unsafe(
-            `INSERT INTO ${T.master_input}
-               (id, template_id, version_id, key, value, ref, type, options,
-                section, ord, display_name, kind, group_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-            [
-              newObjectId(), templateId, newVersionId,
-              mi.key, mi.value, mi.ref, mi.type, mi.options,
-              mi.section, mi.ord, mi.display_name, mi.kind,
-              mi.group_id ? (oldToNewGroupId.get(mi.group_id) ?? null) : null,
-            ],
-          );
-        }
+
+        // 3) Master inputs — group_id remapped via the same SHA256(newVer || id)
+        //    scheme used in step 2 so the FK lines up without a JS map round-trip.
+        await tx.unsafe(
+          `INSERT INTO ${T.master_input}
+             (id, template_id, version_id, key, value, ref, type, options,
+              section, ord, display_name, kind, group_id)
+           SELECT
+             substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
+             m.template_id, $1, m.key, m.value, m.ref, m.type, m.options,
+             m.section, m.ord, m.display_name, m.kind,
+             CASE WHEN m.group_id IS NULL THEN NULL
+                  ELSE substr(encode(digest($1 || m.group_id, 'sha256'), 'hex'), 1, 24)
+             END
+           FROM ${T.master_input} m
+           WHERE m.template_id = $2 AND m.version_id = $3`,
+          [newVersionId, templateId, sourceVersionId],
+        );
       }
     });
   } catch (e) {
