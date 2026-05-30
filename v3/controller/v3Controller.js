@@ -909,18 +909,20 @@ export async function createVersion(req, res) {
         // Backup button. INSERT … SELECT keeps the data in Postgres so
         // it's a single round-trip per table.
 
-        // 1) Pages — copy every column except (id, version_id). Generate
-        //    a fresh id per row server-side via `gen_random_uuid()` mapped
-        //    to a 24-char hex (matches the newObjectId() shape — uses the
-        //    first 24 hex chars of a UUID v4 cast to text).
+        // 1) Pages — copy every column except (id, version_id). New page
+        //    id is DETERMINISTIC: substr(sha256(newVerId || oldId), 24).
+        //    Picking SHA-256 instead of gen_random_uuid() so the master-
+        //    input copy in step 3 can remap multiselect options.pages[]
+        //    (which holds page IDs) using the exact same formula —
+        //    otherwise those references die after a backup.
         await tx.unsafe(
           `INSERT INTO ${T.v3_pages}
              (id, template_id, version_id, name, ord, row_count, col_count, size,
               orientation, scale, hidden, is_imported, columns_order, column_widths,
               row_heights, cells, styles, merges, schemes)
            SELECT
-             substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
-             template_id, $1, name, ord, row_count, col_count, size,
+             substr(encode(digest($1::text || id, 'sha256'), 'hex'), 1, 24),
+             template_id, $1::text, name, ord, row_count, col_count, size,
              orientation, scale, hidden, is_imported, columns_order, column_widths,
              row_heights, cells, styles, merges, schemes
            FROM ${T.v3_pages}
@@ -954,13 +956,53 @@ export async function createVersion(req, res) {
 
         // 3) Master inputs — group_id remapped via the same SHA256(newVer || id)
         //    scheme used in step 2 so the FK lines up without a JS map round-trip.
+        //
+        //    `options` ALSO needs remapping for multiselect MIs: each option
+        //    object carries a `pages` array of 24-char page IDs (see
+        //    FE/.../schemeVisibility.js — `option.pages[i]` is matched
+        //    against `page.id` to compute scheme-driven page visibility).
+        //    Without remap, the new version's options keep referencing the
+        //    OLD version's page IDs and every selected scheme resolves to
+        //    zero visible pages.
+        //
+        //    The CASE below walks the options array (only when it IS a JSON
+        //    array — `select`-type options can be plain strings; `boolean`
+        //    has no options); for each entry that's an OBJECT with a
+        //    `pages` key, it rewrites every page-id under that key via the
+        //    same `substr(sha256(newVer || pid), 24)` formula step 1 uses
+        //    to derive new page IDs. Non-multiselect entries and entries
+        //    without `pages` pass through unchanged. `option.cell` (page-
+        //    name-based) is untouched on purpose.
         await tx.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
               section, ord, display_name, kind, group_id)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
-             m.template_id, $1::text, m.key, m.value, m.ref, m.type, m.options,
+             m.template_id, $1::text, m.key, m.value, m.ref, m.type,
+             CASE
+               WHEN m.options IS NULL OR jsonb_typeof(m.options) <> 'array' THEN m.options
+               ELSE (
+                 SELECT jsonb_agg(
+                   CASE
+                     WHEN jsonb_typeof(opt) = 'object' AND opt ? 'pages' THEN
+                       jsonb_set(
+                         opt,
+                         '{pages}',
+                         COALESCE(
+                           (SELECT jsonb_agg(
+                              substr(encode(digest($1::text || pid, 'sha256'), 'hex'), 1, 24)
+                            )
+                            FROM jsonb_array_elements_text(opt->'pages') AS pid),
+                           '[]'::jsonb
+                         )
+                       )
+                     ELSE opt
+                   END
+                 )
+                 FROM jsonb_array_elements(m.options) AS opt
+               )
+             END AS options,
              m.section, m.ord, m.display_name, m.kind,
              CASE WHEN m.group_id IS NULL THEN NULL
                   ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
