@@ -153,6 +153,17 @@ export async function patchTemplate(req, res) {
     params,
   );
   if (!row) return res.status(404).json({ error: "Template not found" });
+  // Broadcast template metadata changes so open editors repaint without a
+  // manual reload. The page-group and input-section UIs in retemplate1
+  // listen for this event and patch `tpl` in place. We also surface which
+  // fields changed so listeners can skip irrelevant updates cheaply.
+  broadcast({
+    type: "template.updated",
+    templateId: row.id,
+    fields: fields.filter(([, key]) => Object.prototype.hasOwnProperty.call(b, key)).map(([, key]) => key),
+    template: row,
+    clientId: req.get("x-client-id") || null,
+  });
   res.json(row);
 }
 
