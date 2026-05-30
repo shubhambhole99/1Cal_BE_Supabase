@@ -217,6 +217,14 @@ export async function bulkCreateMasterInputs(req, res) {
   } catch (e) {
     return res.status(500).json({ error: `Bulk create failed: ${e.message}` });
   }
+  broadcast({
+    type: "masterInput.updated",
+    templateId: b.template_id,
+    versionId,
+    reason: "mis.bulk_created",
+    count: ids.length,
+    clientId: req.get("x-client-id") || null,
+  });
   res.status(201).json({ count: ids.length, ids });
 }
 
@@ -246,6 +254,13 @@ export async function reorderMasterInputs(req, res) {
   } catch (e) {
     return res.status(500).json({ error: `reorder failed: ${e.message}` });
   }
+  broadcast({
+    type: "masterInput.updated",
+    templateId: template_id,
+    versionId: vId,
+    reason: "mis.reordered",
+    clientId: req.get("x-client-id") || null,
+  });
   res.json({ ok: true, count: ids.length });
 }
 
@@ -469,6 +484,14 @@ export async function createMasterInput(req, res) {
     ],
   );
   const [row] = await sql.unsafe(`SELECT * FROM ${T.master_input} WHERE id = $1`, [id]);
+  broadcast({
+    type: "masterInput.updated",
+    templateId: row.template_id,
+    versionId: row.version_id,
+    masterInputId: row.id,
+    reason: "mi.created",
+    clientId: req.get("x-client-id") || null,
+  });
   res.status(201).json(row);
 }
 
@@ -524,10 +547,18 @@ export async function patchMasterInput(req, res) {
 export async function deleteMasterInput(req, res) {
   const sql = getSql();
   const [row] = await sql.unsafe(
-    `DELETE FROM ${T.master_input} WHERE id = $1 RETURNING id`,
+    `DELETE FROM ${T.master_input} WHERE id = $1 RETURNING id, template_id, version_id`,
     [req.params.id],
   );
   if (!row) return res.status(404).json({ error: "Master input not found" });
+  broadcast({
+    type: "masterInput.updated",
+    templateId: row.template_id,
+    versionId: row.version_id,
+    masterInputId: row.id,
+    reason: "mi.deleted",
+    clientId: req.get("x-client-id") || null,
+  });
   res.status(204).end();
 }
 
@@ -580,6 +611,14 @@ export async function createMasterInputGroup(req, res) {
     return res.status(500).json({ error: `Create group failed: ${e.message}` });
   }
   const [row] = await sql.unsafe(`SELECT * FROM ${T.master_input_group} WHERE id = $1`, [id]);
+  broadcast({
+    type: "masterInput.updated",
+    templateId: row.template_id,
+    versionId: row.version_id,
+    groupId: row.id,
+    reason: "group.created",
+    clientId: req.get("x-client-id") || null,
+  });
   res.status(201).json(row);
 }
 
@@ -632,6 +671,14 @@ export async function bulkCreateMasterInputGroups(req, res) {
   } catch (e) {
     return res.status(500).json({ error: `Bulk create groups failed: ${e.message}` });
   }
+  broadcast({
+    type: "masterInput.updated",
+    templateId: b.template_id,
+    versionId,
+    reason: "groups.bulk_created",
+    count: ids.length,
+    clientId: req.get("x-client-id") || null,
+  });
   res.status(201).json({ count: ids.length, ids, keyToId });
 }
 
@@ -662,6 +709,19 @@ export async function patchMasterInputGroup(req, res) {
     params,
   );
   if (!row) return res.status(404).json({ error: "Group not found" });
+  // Re-use the masterInput.updated event the FE already handles — it refetches
+  // BOTH the MI list and the group list when it fires, so changing a group's
+  // section / display_name / ord / parent flows into the open editor without
+  // a reload. Cell + page broadcasts have their own event types; this one
+  // covers everything under /v3/templates/:id/master-inputs.
+  broadcast({
+    type: "masterInput.updated",
+    templateId: row.template_id,
+    versionId: row.version_id,
+    groupId: row.id,
+    reason: "group.patched",
+    clientId: req.get("x-client-id") || null,
+  });
   res.json(row);
 }
 
@@ -670,10 +730,18 @@ export async function patchMasterInputGroup(req, res) {
 export async function deleteMasterInputGroup(req, res) {
   const sql = getSql();
   const [row] = await sql.unsafe(
-    `DELETE FROM ${T.master_input_group} WHERE id = $1 RETURNING id`,
+    `DELETE FROM ${T.master_input_group} WHERE id = $1 RETURNING id, template_id, version_id`,
     [req.params.id],
   );
   if (!row) return res.status(404).json({ error: "Group not found" });
+  broadcast({
+    type: "masterInput.updated",
+    templateId: row.template_id,
+    versionId: row.version_id,
+    groupId: row.id,
+    reason: "group.deleted",
+    clientId: req.get("x-client-id") || null,
+  });
   res.status(204).end();
 }
 
@@ -703,6 +771,13 @@ export async function reorderMasterInputGroups(req, res) {
   } catch (e) {
     return res.status(500).json({ error: `reorder failed: ${e.message}` });
   }
+  broadcast({
+    type: "masterInput.updated",
+    templateId: template_id,
+    versionId: vId,
+    reason: "groups.reordered",
+    clientId: req.get("x-client-id") || null,
+  });
   res.json({ ok: true, count: ids.length });
 }
 
