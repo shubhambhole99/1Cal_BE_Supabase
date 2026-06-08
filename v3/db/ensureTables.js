@@ -111,6 +111,7 @@ export async function ensureTables() {
       description           TEXT,
       user_id               VARCHAR(24),
       published_version_id  VARCHAR(24),
+      draft_version_id      VARCHAR(24),
       legacy_template_id    VARCHAR(24),
       input_sections        JSONB DEFAULT '[]'::jsonb,
       created_at            TIMESTAMPTZ DEFAULT NOW(),
@@ -376,10 +377,23 @@ export async function ensureTables() {
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS input_sections JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS page_groups JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS published_version_id VARCHAR(24)`,
+      `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS draft_version_id VARCHAR(24)`,
+      // Per-version changelog / release notes (markdown), editable from the
+      // version list's edit modal.
+      `ALTER TABLE ${ref("v3_versions")} ADD COLUMN IF NOT EXISTS notes TEXT`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT FALSE`,
       `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS collaborators JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS schemes JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS row_heights JSONB DEFAULT '{}'::jsonb`,
+      // Per-page freeze panes (count of frozen top rows / left columns). Server-
+      // persisted so they're shared across users and copied on version forks.
+      `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS freeze_rows INTEGER DEFAULT 0`,
+      `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS freeze_cols INTEGER DEFAULT 0`,
+      // Per-page print settings (template defaults): { area, orientation, paper,
+      // margins, scale }. Instances inherit these and may override per page.
+      `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS print_settings JSONB DEFAULT '{}'::jsonb`,
+      // Per-instance print overrides, keyed by page id → partial print settings.
+      `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS print_overrides JSONB DEFAULT '{}'::jsonb`,
       // Instance overrides keyed by the template MI's stable `key` (not by id),
       // so a delete-and-recreate of the template MI under the same key (e.g. on
       // JSON restore or xlsx import) preserves the instance's value.

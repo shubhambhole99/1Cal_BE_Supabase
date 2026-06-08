@@ -18,6 +18,7 @@ router.get("/templates/:id/master-inputs", ctrl.getMasterInputs);
 router.get("/templates/:id/versions", ctrl.listVersions);
 router.post("/templates/:id/versions", ctrl.createVersion);
 router.post("/templates/:id/versions/:targetVersionId/restore", ctrl.restoreVersion);
+router.patch("/templates/:id/versions/:versionId", ctrl.patchVersion);
 router.delete("/templates/:id/versions/:versionId", ctrl.deleteVersion);
 router.post("/templates/:id/publish", ctrl.publishVersion);
 

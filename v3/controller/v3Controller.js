@@ -35,6 +35,109 @@ async function resolveVersionId(sql, templateId, explicit) {
   return t?.published_version_id || null;
 }
 
+// ── Published-version write guard ─────────────────────────────────────────────
+// The published version is a LOCKED release: editing happens on the draft, and
+// Publish promotes the draft. These helpers let content-mutating endpoints
+// reject any write whose target version is the published one (403). Version-
+// management handlers (createVersion / publish / restore / ensureDraft) are
+// intentionally NOT guarded — they legitimately operate across versions.
+const PUBLISHED_LOCK_MSG =
+  "The published version is locked. Edit the draft (it auto-promotes on Publish).";
+async function isPublishedVersion(sql, templateId, versionId) {
+  if (!templateId || !versionId) return false;
+  const [t] = await sql.unsafe(
+    `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+    [templateId],
+  );
+  return !!(t && t.published_version_id && t.published_version_id === versionId);
+}
+// For by-id PATCH/DELETE: look up the row's (template_id, version_id) and check.
+// Returns true when the row belongs to the published version (caller should 403).
+async function rowIsPublished(sql, table, rowId) {
+  const [row] = await sql.unsafe(
+    `SELECT template_id, version_id FROM ${table} WHERE id = $1 LIMIT 1`,
+    [rowId],
+  );
+  if (!row) return false; // let the handler 404 naturally
+  return isPublishedVersion(sql, row.template_id, row.version_id);
+}
+
+// ── Copy one version's full content (pages + groups + master inputs) into a
+// pre-created NEW version, inside an existing transaction. Extracted from
+// createVersion so ensureDraft / publish can reuse the exact same forking SQL
+// (deterministic SHA-256 id remapping for page ids, group ids, parent_group_id,
+// MI group_id, and multiselect options.pages[]).
+async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersionId) {
+  // 1) Pages
+  await tx.unsafe(
+    `INSERT INTO ${T.v3_pages}
+       (id, template_id, version_id, name, ord, row_count, col_count, size,
+        orientation, scale, hidden, is_imported, columns_order, column_widths,
+        row_heights, cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings)
+     SELECT
+       substr(encode(digest($1::text || id, 'sha256'), 'hex'), 1, 24),
+       template_id, $1::text, name, ord, row_count, col_count, size,
+       orientation, scale, hidden, is_imported, columns_order, column_widths,
+       row_heights, cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings
+     FROM ${T.v3_pages}
+     WHERE template_id = $2 AND version_id = $3`,
+    [newVersionId, templateId, sourceVersionId],
+  );
+  // 2) Master-input groups
+  await tx.unsafe(
+    `INSERT INTO ${T.master_input_group}
+       (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+     SELECT
+       substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
+       g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
+       CASE WHEN g.parent_group_id IS NULL THEN NULL
+            ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
+       END
+     FROM ${T.master_input_group} g
+     WHERE g.template_id = $2 AND g.version_id = $3`,
+    [newVersionId, templateId, sourceVersionId],
+  );
+  // 3) Master inputs (group_id + multiselect options.pages[] remapped)
+  await tx.unsafe(
+    `INSERT INTO ${T.master_input}
+       (id, template_id, version_id, key, value, ref, type, options,
+        section, ord, display_name, kind, group_id)
+     SELECT
+       substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
+       m.template_id, $1::text, m.key, m.value, m.ref, m.type,
+       CASE
+         WHEN m.options IS NULL OR jsonb_typeof(m.options) <> 'array' THEN m.options
+         ELSE (
+           SELECT jsonb_agg(
+             CASE
+               WHEN jsonb_typeof(opt) = 'object' AND opt ? 'pages' THEN
+                 jsonb_set(
+                   opt,
+                   '{pages}',
+                   COALESCE(
+                     (SELECT jsonb_agg(
+                        substr(encode(digest($1::text || pid, 'sha256'), 'hex'), 1, 24)
+                      )
+                      FROM jsonb_array_elements_text(opt->'pages') AS pid),
+                     '[]'::jsonb
+                   )
+                 )
+               ELSE opt
+             END
+           )
+           FROM jsonb_array_elements(m.options) AS opt
+         )
+       END AS options,
+       m.section, m.ord, m.display_name, m.kind,
+       CASE WHEN m.group_id IS NULL THEN NULL
+            ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
+       END
+     FROM ${T.master_input} m
+     WHERE m.template_id = $2 AND m.version_id = $3`,
+    [newVersionId, templateId, sourceVersionId],
+  );
+}
+
 // ── GET /v3/templates ──────────────────────────────────────────────────────────
 export async function listTemplates(_req, res) {
   const sql = getSql();
@@ -135,6 +238,10 @@ export async function patchTemplate(req, res) {
     ["page_groups", "page_groups"],
     ["disabled", "disabled"],
     ["ord", "ord"],
+    // Persisted pointer to the version the editor currently has open (the
+    // "active editing version"). The published version is locked; any other
+    // version is editable. Saved here so reopening returns to the same version.
+    ["draft_version_id", "draft_version_id"],
   ];
   const sets = [];
   const params = [req.params.id];
@@ -182,6 +289,9 @@ export async function bulkCreateMasterInputs(req, res) {
   if (b.masterInputs.length === 0) return res.json({ count: 0, ids: [] });
 
   const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
+  if (await isPublishedVersion(sql, b.template_id, versionId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const ids = [];
   try {
     await sql.begin(async (tx) => {
@@ -239,6 +349,9 @@ export async function reorderMasterInputs(req, res) {
     return res.status(400).json({ error: "template_id and non-empty ids[] required" });
   }
   const vId = await resolveVersionId(sql, template_id, version_id);
+  if (await isPublishedVersion(sql, template_id, vId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   try {
     await sql.begin(async (tx) => {
       for (let i = 0; i < ids.length; i++) {
@@ -280,7 +393,8 @@ export async function getTemplate(req, res) {
 
   const pages = await sql.unsafe(
     `SELECT id, name, ord, row_count, col_count, size, orientation, scale,
-            hidden, is_imported, version_id, schemes
+            hidden, is_imported, version_id, schemes, freeze_rows, freeze_cols,
+            print_settings
      FROM ${T.v3_pages}
      WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)
      ORDER BY ord ASC, name ASC`,
@@ -288,7 +402,7 @@ export async function getTemplate(req, res) {
   );
 
   const versions = await sql.unsafe(
-    `SELECT id, label, author_id, created_at FROM ${T.v3_versions}
+    `SELECT id, label, notes, author_id, created_at FROM ${T.v3_versions}
      WHERE template_id = $1 ORDER BY created_at ASC`,
     [id],
   );
@@ -308,6 +422,9 @@ export async function reorderPages(req, res) {
     return res.status(400).json({ error: "template_id and non-empty ids[] required" });
   }
   const vId = await resolveVersionId(sql, template_id, version_id);
+  if (await isPublishedVersion(sql, template_id, vId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   try {
     await sql.begin(async (tx) => {
       // Pass 1 — bump every affected ord by a large offset so the constraint
@@ -352,6 +469,9 @@ export async function createPage(req, res) {
   if (!versionId) {
     return res.status(400).json({ error: "Template has no published version yet" });
   }
+  if (await isPublishedVersion(sql, b.template_id, versionId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
 
   let ord = b.ord;
   if (!Number.isFinite(ord)) {
@@ -372,8 +492,9 @@ export async function createPage(req, res) {
   await sql.unsafe(
     `INSERT INTO ${T.v3_pages}
        (id, template_id, version_id, name, ord, row_count, col_count,
-        hidden, cells, styles, merges, column_widths, row_heights, schemes)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        hidden, cells, styles, merges, column_widths, row_heights, schemes,
+        freeze_rows, freeze_cols, print_settings)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
     [
       id,
       b.template_id,
@@ -389,6 +510,9 @@ export async function createPage(req, res) {
       b.column_widths && typeof b.column_widths === "object" ? b.column_widths : {},
       b.row_heights && typeof b.row_heights === "object" ? b.row_heights : {},
       Array.isArray(b.schemes) ? b.schemes : [],
+      Number.isFinite(b.freeze_rows) ? Math.max(0, Math.min(20, Math.trunc(b.freeze_rows))) : 0,
+      Number.isFinite(b.freeze_cols) ? Math.max(0, Math.min(20, Math.trunc(b.freeze_cols))) : 0,
+      b.print_settings && typeof b.print_settings === "object" && !Array.isArray(b.print_settings) ? b.print_settings : {},
     ],
   );
 
@@ -461,6 +585,9 @@ export async function createMasterInput(req, res) {
     return res.status(400).json({ error: "Use POST /v3/master-input-groups to create a group" });
   }
   const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
+  if (await isPublishedVersion(sql, b.template_id, versionId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const id = newObjectId();
   await sql.unsafe(
     `INSERT INTO ${T.master_input}
@@ -501,6 +628,9 @@ export async function patchMasterInput(req, res) {
   const b = req.body || {};
   if (b.type === "group") {
     return res.status(400).json({ error: "type='group' is not a valid master-input type" });
+  }
+  if (await rowIsPublished(sql, T.master_input, req.params.id)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
   const fields = [
     ["key", "key"],
@@ -546,6 +676,9 @@ export async function patchMasterInput(req, res) {
 // ── DELETE /v3/master-inputs/:id ──────────────────────────────────────────────
 export async function deleteMasterInput(req, res) {
   const sql = getSql();
+  if (await rowIsPublished(sql, T.master_input, req.params.id)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const [row] = await sql.unsafe(
     `DELETE FROM ${T.master_input} WHERE id = $1 RETURNING id, template_id, version_id`,
     [req.params.id],
@@ -590,6 +723,9 @@ export async function createMasterInputGroup(req, res) {
     return res.status(400).json({ error: "template_id and key required" });
   }
   const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
+  if (await isPublishedVersion(sql, b.template_id, versionId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const id = newObjectId();
   try {
     await sql.unsafe(
@@ -637,6 +773,9 @@ export async function bulkCreateMasterInputGroups(req, res) {
     return res.json({ count: 0, ids: [], keyToId: {} });
   }
   const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
+  if (await isPublishedVersion(sql, b.template_id, versionId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const ids = [];
   const keyToId = {};
   try {
@@ -686,6 +825,9 @@ export async function bulkCreateMasterInputGroups(req, res) {
 export async function patchMasterInputGroup(req, res) {
   const sql = getSql();
   const b = req.body || {};
+  if (await rowIsPublished(sql, T.master_input_group, req.params.id)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const fields = [
     ["key", "key"],
     ["display_name", "display_name"],
@@ -729,6 +871,9 @@ export async function patchMasterInputGroup(req, res) {
 // Children of this group survive (their group_id is set to NULL by the FK).
 export async function deleteMasterInputGroup(req, res) {
   const sql = getSql();
+  if (await rowIsPublished(sql, T.master_input_group, req.params.id)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const [row] = await sql.unsafe(
     `DELETE FROM ${T.master_input_group} WHERE id = $1 RETURNING id, template_id, version_id`,
     [req.params.id],
@@ -756,6 +901,9 @@ export async function reorderMasterInputGroups(req, res) {
     return res.status(400).json({ error: "template_id and non-empty ids[] required" });
   }
   const vId = await resolveVersionId(sql, template_id, version_id);
+  if (await isPublishedVersion(sql, template_id, vId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   try {
     await sql.begin(async (tx) => {
       for (let i = 0; i < ids.length; i++) {
@@ -783,9 +931,20 @@ export async function reorderMasterInputGroups(req, res) {
 
 // ── PATCH /v3/pages/:id ────────────────────────────────────────────────────────
 // Sparse patch — merge into existing cells / styles JSONB.
+// Page fields that are purely cosmetic / view-only — allowed even on the
+// published (locked) version, since they don't change the released content or
+// calculations. A patch touching ONLY these skips the publish lock.
+const COSMETIC_PAGE_FIELDS = new Set(["freeze_rows", "freeze_cols", "print_settings"]);
+
 export async function patchPage(req, res) {
   const sql = getSql();
   const { id } = req.params;
+  const bodyKeys = Object.keys(req.body || {});
+  const cosmeticOnly =
+    bodyKeys.length > 0 && bodyKeys.every((k) => COSMETIC_PAGE_FIELDS.has(k));
+  if (!cosmeticOnly && (await rowIsPublished(sql, T.v3_pages, id))) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const { cells, removeCells, styles, removeStyles, merges, name, hidden, ord, schemes, column_widths, row_heights } = req.body || {};
 
   const updates = [];
@@ -872,6 +1031,22 @@ export async function patchPage(req, res) {
     params.push(row_heights);
     i++;
   }
+  if (Number.isFinite(req.body?.freeze_rows)) {
+    updates.push(`freeze_rows = $${i}`);
+    params.push(Math.max(0, Math.min(20, Math.trunc(req.body.freeze_rows))));
+    i++;
+  }
+  if (Number.isFinite(req.body?.freeze_cols)) {
+    updates.push(`freeze_cols = $${i}`);
+    params.push(Math.max(0, Math.min(20, Math.trunc(req.body.freeze_cols))));
+    i++;
+  }
+  if (req.body?.print_settings && typeof req.body.print_settings === "object" && !Array.isArray(req.body.print_settings)) {
+    // Full-replace the page's print settings object (FE sends the whole bag).
+    updates.push(`print_settings = $${i}`);
+    params.push(req.body.print_settings);
+    i++;
+  }
 
   if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
 
@@ -905,6 +1080,9 @@ export async function patchPage(req, res) {
 export async function deletePage(req, res) {
   const sql = getSql();
   const { id } = req.params;
+  if (await rowIsPublished(sql, T.v3_pages, id)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
   const result = await sql.unsafe(
     `DELETE FROM ${T.v3_pages} WHERE id = $1 RETURNING id`,
     [id],
@@ -919,7 +1097,7 @@ export async function deletePage(req, res) {
 export async function listVersions(req, res) {
   const sql = getSql();
   const rows = await sql.unsafe(
-    `SELECT id, label, author_id, created_at FROM ${T.v3_versions}
+    `SELECT id, label, notes, author_id, created_at FROM ${T.v3_versions}
      WHERE template_id = $1 ORDER BY created_at ASC`,
     [req.params.id],
   );
@@ -1188,96 +1366,78 @@ export async function restoreVersion(req, res) {
     );
     emit({ phase: "wipe-done" });
 
-    // Copy pages one by one; emit progress per page.
-    const srcPages = await sql.unsafe(
-      `SELECT * FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2 ORDER BY ord`,
-      [templateId, sourceVersionId],
+    // Bulk copy via INSERT…SELECT — keeps the data inside Postgres so it's ONE
+    // round-trip per table instead of ~1700. Uses the same deterministic
+    // SHA-256 id remapping as the version-fork, so group ids, parent_group_id,
+    // MI group_id, and multiselect options.pages[] all line up without a JS
+    // map. Progress is emitted per table (each statement is fast).
+    // 1) Pages — new id = substr(sha256(targetVerId || oldId), 24).
+    await sql.unsafe(
+      `INSERT INTO ${T.v3_pages}
+         (id, template_id, version_id, name, ord, row_count, col_count, size,
+          orientation, scale, hidden, is_imported, columns_order, column_widths,
+          row_heights, cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings)
+       SELECT
+         substr(encode(digest($1::text || id, 'sha256'), 'hex'), 1, 24),
+         template_id, $1::text, name, ord, row_count, col_count, size,
+         orientation, scale, hidden, is_imported, columns_order, column_widths,
+         row_heights, cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings
+       FROM ${T.v3_pages}
+       WHERE template_id = $2 AND version_id = $3`,
+      [targetVersionId, templateId, sourceVersionId],
     );
-    for (let i = 0; i < srcPages.length; i++) {
-      const p = srcPages[i];
-      await sql.unsafe(
-        `INSERT INTO ${T.v3_pages}
-           (id, template_id, version_id, name, ord, row_count, col_count, size,
-            orientation, scale, hidden, is_imported, columns_order, column_widths,
-            cells, styles, merges)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-        [
-          newObjectId(), templateId, targetVersionId,
-          p.name, p.ord, p.row_count, p.col_count, p.size,
-          p.orientation, p.scale, p.hidden, p.is_imported,
-          p.columns_order, p.column_widths, p.cells, p.styles, p.merges,
-        ],
-      );
-      emit({ phase: "pages", done: i + 1, total: srcPages.length, name: p.name });
-    }
+    emit({ phase: "pages", done: pageCount, total: pageCount });
 
-    // Copy MI groups; emit per group.
-    const srcGroups = await sql.unsafe(
-      `SELECT * FROM ${T.master_input_group}
-       WHERE template_id = $1 AND version_id = $2 ORDER BY ord`,
-      [templateId, sourceVersionId],
+    // 2) MI groups — group id + parent_group_id remapped via the same hash.
+    await sql.unsafe(
+      `INSERT INTO ${T.master_input_group}
+         (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+       SELECT
+         substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
+         g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
+         CASE WHEN g.parent_group_id IS NULL THEN NULL
+              ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
+         END
+       FROM ${T.master_input_group} g
+       WHERE g.template_id = $2 AND g.version_id = $3`,
+      [targetVersionId, templateId, sourceVersionId],
     );
-    const oldToNewGroupId = new Map();
-    for (let i = 0; i < srcGroups.length; i++) {
-      const g = srcGroups[i];
-      const newId = newObjectId();
-      oldToNewGroupId.set(g.id, newId);
-      await sql.unsafe(
-        `INSERT INTO ${T.master_input_group}
-           (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [
-          newId, templateId, targetVersionId,
-          g.key, g.display_name, g.section, g.ord, null,
-        ],
-      );
-      emit({
-        phase: "groups", done: i + 1, total: srcGroups.length,
-        name: g.display_name || g.key,
-      });
-    }
-    // Second pass: remap parent_group_id (no progress needed — fast).
-    for (const g of srcGroups) {
-      if (!g.parent_group_id) continue;
-      const newId = oldToNewGroupId.get(g.id);
-      const newParent = oldToNewGroupId.get(g.parent_group_id);
-      if (newId && newParent) {
-        await sql.unsafe(
-          `UPDATE ${T.master_input_group} SET parent_group_id = $1 WHERE id = $2`,
-          [newParent, newId],
-        );
-      }
-    }
+    emit({ phase: "groups", done: groupCount, total: groupCount });
 
-    // Copy master inputs; emit every BATCH inserts to avoid flooding the wire
-    // (~600+ MIs is common, so per-row events would create 600+ chunks).
-    const srcMIs = await sql.unsafe(
-      `SELECT * FROM ${T.master_input} WHERE template_id = $1 AND version_id = $2 ORDER BY ord`,
-      [templateId, sourceVersionId],
+    // 3) Master inputs — group_id + multiselect options.pages[] remapped via
+    // the same SHA-256 scheme. One INSERT…SELECT for the whole set.
+    await sql.unsafe(
+      `INSERT INTO ${T.master_input}
+         (id, template_id, version_id, key, value, ref, type, options,
+          section, ord, display_name, kind, group_id)
+       SELECT
+         substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
+         m.template_id, $1::text, m.key, m.value, m.ref, m.type,
+         CASE
+           WHEN m.options IS NULL OR jsonb_typeof(m.options) <> 'array' THEN m.options
+           ELSE (
+             SELECT jsonb_agg(
+               CASE
+                 WHEN jsonb_typeof(opt) = 'object' AND opt ? 'pages' THEN
+                   jsonb_set(opt, '{pages}', COALESCE(
+                     (SELECT jsonb_agg(substr(encode(digest($1::text || pid, 'sha256'), 'hex'), 1, 24))
+                      FROM jsonb_array_elements_text(opt->'pages') AS pid),
+                     '[]'::jsonb))
+                 ELSE opt
+               END
+             )
+             FROM jsonb_array_elements(m.options) AS opt
+           )
+         END AS options,
+         m.section, m.ord, m.display_name, m.kind,
+         CASE WHEN m.group_id IS NULL THEN NULL
+              ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
+         END
+       FROM ${T.master_input} m
+       WHERE m.template_id = $2 AND m.version_id = $3`,
+      [targetVersionId, templateId, sourceVersionId],
     );
-    const BATCH = 20;
-    for (let i = 0; i < srcMIs.length; i++) {
-      const mi = srcMIs[i];
-      await sql.unsafe(
-        `INSERT INTO ${T.master_input}
-           (id, template_id, version_id, key, value, ref, type, options,
-            section, ord, display_name, kind, group_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-        [
-          newObjectId(), templateId, targetVersionId,
-          mi.key, mi.value, mi.ref, mi.type, mi.options,
-          mi.section, mi.ord, mi.display_name, mi.kind,
-          mi.group_id ? (oldToNewGroupId.get(mi.group_id) ?? null) : null,
-        ],
-      );
-      const done = i + 1;
-      if (done === srcMIs.length || done % BATCH === 0) {
-        emit({
-          phase: "mis", done, total: srcMIs.length,
-          name: mi.display_name || mi.key,
-        });
-      }
-    }
+    emit({ phase: "mis", done: miCount, total: miCount });
 
     emit({ phase: "done" });
     res.end();
@@ -1288,13 +1448,16 @@ export async function restoreVersion(req, res) {
 }
 
 // POST /v3/templates/:id/publish
-// Body: { version_id }
-// Flips published_version_id to point at the chosen version. The previously
-// published version still exists — it just isn't "live" anymore.
+// Body: { version_id, label? }
+// Promotes a (non-published) version to the live published release. Pure
+// pointer flip — NO fork, NO new "draft". The version being published becomes
+// locked; the PREVIOUSLY published version is now just another non-published
+// version and is editable again. Existing instances stay pinned to their own
+// version; only NEW instances use the new release.
 export async function publishVersion(req, res) {
   const sql = getSql();
   const { id: templateId } = req.params;
-  const { version_id } = req.body || {};
+  const { version_id, label } = req.body || {};
   if (!version_id) return res.status(400).json({ error: "version_id required" });
 
   const [v] = await sql.unsafe(
@@ -1303,13 +1466,60 @@ export async function publishVersion(req, res) {
   );
   if (!v) return res.status(404).json({ error: "Version not found for this template" });
 
-  const [tpl] = await sql.unsafe(
-    `UPDATE ${T.v3_templates}
-       SET published_version_id = $1, updated_at = NOW()
-     WHERE id = $2 RETURNING *`,
-    [version_id, templateId],
-  );
+  try {
+    await sql.begin(async (tx) => {
+      if (label && String(label).trim()) {
+        await tx.unsafe(`UPDATE ${T.v3_versions} SET label = $1 WHERE id = $2`, [
+          String(label).trim(),
+          version_id,
+        ]);
+      }
+      await tx.unsafe(
+        `UPDATE ${T.v3_templates} SET published_version_id = $1, updated_at = NOW() WHERE id = $2`,
+        [version_id, templateId],
+      );
+    });
+  } catch (e) {
+    return res.status(500).json({ error: `Publish failed: ${e.message}` });
+  }
+
+  const [tpl] = await sql.unsafe(`SELECT * FROM ${T.v3_templates} WHERE id = $1`, [templateId]);
   res.json(tpl);
+}
+
+// PATCH /v3/templates/:id/versions/:versionId  { label?, notes? }
+// Edit a version's metadata — its label (rename) and/or its `notes` markdown
+// changelog. Content (pages/MIs) is untouched. Works for any version,
+// including the published one (label + notes are metadata, not content).
+export async function patchVersion(req, res) {
+  const sql = getSql();
+  const { id: templateId, versionId } = req.params;
+  const b = req.body || {};
+
+  const sets = [];
+  const params = [versionId, templateId];
+  let i = 3;
+  if (Object.prototype.hasOwnProperty.call(b, "label")) {
+    const label = String(b.label ?? "").trim();
+    if (!label) return res.status(400).json({ error: "label cannot be empty" });
+    sets.push(`label = $${i++}`);
+    params.push(label);
+  }
+  if (Object.prototype.hasOwnProperty.call(b, "notes")) {
+    // notes may be empty (clearing the changelog) — keep it as-is, just stringify.
+    sets.push(`notes = $${i++}`);
+    params.push(b.notes == null ? null : String(b.notes));
+  }
+  if (sets.length === 0) return res.status(400).json({ error: "label or notes required" });
+
+  const [row] = await sql.unsafe(
+    `UPDATE ${T.v3_versions} SET ${sets.join(", ")}
+       WHERE id = $1 AND template_id = $2
+     RETURNING id, label, notes, author_id, created_at`,
+    params,
+  );
+  if (!row) return res.status(404).json({ error: "Version not found for this template" });
+  res.json(row);
 }
 
 // DELETE /v3/templates/:id/versions/:versionId
@@ -1600,7 +1810,7 @@ export async function getInstance(req, res) {
     // back to the browser-natural height in the instance view.
     `SELECT id, name, ord, row_count, col_count, size, orientation, scale,
             hidden, is_imported, columns_order, column_widths, row_heights,
-            cells, styles, merges, schemes
+            cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings
      FROM ${T.v3_pages}
      WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)
      ORDER BY ord ASC, name ASC`,
@@ -1667,6 +1877,7 @@ export async function patchInstance(req, res) {
   const fields = [
     ["name", "name"],
     ["collaborators", "collaborators"],
+    ["print_overrides", "print_overrides"],
   ];
   const sets = [];
   const params = [req.params.id];
