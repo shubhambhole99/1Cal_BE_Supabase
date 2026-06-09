@@ -1805,7 +1805,10 @@ export async function getInstance(req, res) {
     `SELECT * FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
     [inst.template_id],
   );
-  const versionId = inst.version_id || tpl?.published_version_id || null;
+  // Always follow the template's CURRENT published version, ignoring any
+  // version_id pinned on the instance row — so every report (old or new)
+  // auto-resolves to the latest published release with no per-row DB edits.
+  const versionId = tpl?.published_version_id || inst.version_id || null;
 
   const pages = await sql.unsafe(
     // NOTE: `row_heights` must be included here — the instance grid in
@@ -1929,10 +1932,15 @@ export async function getInstanceMasterInputs(req, res) {
   const sql = getSql();
   const id = req.params.id;
   const [inst] = await sql.unsafe(
-    `SELECT template_id, version_id FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`,
+    `SELECT i.template_id, i.version_id, t.published_version_id
+       FROM ${T.v3_instances} i
+       LEFT JOIN ${T.v3_templates} t ON t.id = i.template_id
+      WHERE i.id = $1 LIMIT 1`,
     [id],
   );
   if (!inst) return res.status(404).json({ error: "Instance not found" });
+  // Always follow the template's current published version (see getInstance).
+  const miVersionId = inst.published_version_id || inst.version_id || null;
   const rows = await sql.unsafe(
     `SELECT
         tmi.id,
@@ -1959,7 +1967,7 @@ export async function getInstanceMasterInputs(req, res) {
      WHERE tmi.template_id = $2
        AND ($3::text IS NULL OR tmi.version_id = $3)
      ORDER BY tmi.ord ASC`,
-    [id, inst.template_id, inst.version_id],
+    [id, inst.template_id, miVersionId],
   );
   res.json({ masterInputs: rows });
 }
