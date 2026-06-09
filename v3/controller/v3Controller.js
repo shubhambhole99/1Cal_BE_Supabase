@@ -1740,10 +1740,10 @@ export async function listInstances(req, res) {
 // from v3_master_input at GET time (via LEFT JOIN), and overrides land in
 // v3_instance_master_input lazily — only when the user sets a value.
 //
-// The instance pins its `version_id` (snapshot of the template's published
-// version at creation time). Subsequent template edits within the same
-// version propagate to the instance automatically. Forking a new template
-// version leaves existing instances pinned to their original version.
+// The instance stores version_id = NULL and ALWAYS follows the template's
+// CURRENT published_version_id (resolved at read time in getInstance). So
+// publishing a new version auto-upgrades every instance to that release —
+// instances are never pinned to a stale version.
 export async function createInstance(req, res) {
   const sql = getSql();
   const b = req.body || {};
@@ -1755,7 +1755,11 @@ export async function createInstance(req, res) {
   );
   if (!tpl) return res.status(404).json({ error: "Template not found" });
 
-  const versionId = b.version_id || tpl.published_version_id || null;
+  // Do NOT pin the version. Store NULL so the instance ALWAYS resolves to the
+  // template's CURRENT published_version_id at read time (see getInstance) —
+  // publishing a new version auto-upgrades every instance to it. A caller may
+  // still pass an explicit version_id to deliberately pin a snapshot.
+  const versionId = b.version_id || null;
   const instanceId = newObjectId();
   const instanceName =
     (b.name && String(b.name).trim()) ||
