@@ -1,6 +1,7 @@
 import { config } from "dotenv";
 config({ override: true });
 import postgres from "postgres";
+import { resolveDbUrl } from "./resolveDbUrl.js";
 
 const SCHEMA = process.env.DB_SCHEMA ?? "final";
 const ref = (table) => SCHEMA === "public" ? table : `"${SCHEMA}".${table}`;
@@ -10,7 +11,7 @@ const ref = (table) => SCHEMA === "public" ? table : `"${SCHEMA}".${table}`;
  * Safe to run repeatedly — uses IF NOT EXISTS / information_schema checks.
  */
 export async function ensureTables() {
-  const sql = postgres(process.env.DATABASE_URL, { prepare: false, max: 1 });
+  const sql = postgres(resolveDbUrl(), { prepare: false, max: 1 });
 
   try {
     // Create schema if not public

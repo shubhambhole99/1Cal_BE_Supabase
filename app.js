@@ -16,6 +16,7 @@ import contactRoutes from "./routes/contactRoutes.js";
 import billRoutes from "./routes/billRoutes.js";
 import aboutUsRoutes from "./routes/aboutUsRoutes.js";
 import commentRoutes from "./routes/commentRoutes.js";
+import restrictedRoutes from "./routes/restrictedRoutes.js";
 
 // v3 module (merged from BE 2 — self-contained under ./v3/*)
 import v3Routes from "./v3/routes/v3Routes.js";
@@ -74,6 +75,7 @@ app.use("/contact", contactRoutes);
 app.use("/bill", billRoutes);
 app.use("/aboutus", aboutUsRoutes);
 app.use("/comments", commentRoutes);
+app.use("/restricted", restrictedRoutes);
 app.use("/v3", v3Routes);
 
 // Error handling
@@ -82,26 +84,39 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ error: err.message });
 });
 
-// Local server: DB check + listen (skipped on Vercel)
+// Local server (skipped on Vercel, which runs the app serverless).
+// ENSURE_TABLES="true" in .env -> create/sync DB tables on startup (else skip).
 if (!process.env.VERCEL) {
-  const PORT = 5000;
+  const PORT = process.env.PORT || 5000;
+
+  // 1) Verify DB connectivity first — bail out if we can't reach the DB.
   try {
     await db.execute(sql`SELECT 1`);
     console.log("Supabase connection successful");
+  } catch (err) {
+    console.error("Supabase connection failed:", err);
+    process.exit(1);
+  }
+
+  // 2) Optionally create/sync tables. Skipped unless ENSURE_TABLES="true".
+  //    Skipping is faster and avoids touching the schema (e.g. the v3
+  //    foreign-key error) when the tables already exist.
+  if (String(process.env.ENSURE_TABLES).toLowerCase() === "true") {
     await ensureTables();
-    // v3 tables live in the schema defined by DB_SCHEMA (defaults to "prod"
-    // inside the v3 module). Failing to create them shouldn't take the
-    // legacy BE down, so we log and continue.
+    console.log("legacy tables ensured");
+    // v3 tables live in the schema defined by DB_SCHEMA. Failing to create
+    // them shouldn't take the legacy BE down, so we log and continue.
     try {
       await ensureV3Tables();
       console.log("v3 tables ensured");
     } catch (e) {
       console.error("[ensureV3Tables] failed:", e.message);
     }
-  } catch (err) {
-    console.error("Supabase connection failed:", err);
-    process.exit(1);
+  } else {
+    console.log("Skipping table creation (set ENSURE_TABLES=true to enable)");
   }
+
+  // 3) Start the server.
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });

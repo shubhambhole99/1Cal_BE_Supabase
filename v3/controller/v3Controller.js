@@ -1744,10 +1744,42 @@ export async function listInstances(req, res) {
 // CURRENT published_version_id (resolved at read time in getInstance). So
 // publishing a new version auto-upgrades every instance to that release —
 // instances are never pinned to a stale version.
+// Resolve the requesting user's id from the request (body for parity with the
+// direct-feasibility model; falls back to an auth-middleware-populated req.user).
+function requesterId(req) {
+  const b = req.body || {};
+  return b.user_id ?? b.userid ?? req.user?.id ?? req.user?.userId ?? null;
+}
+
+// Edit-permission gate for an instance. The owner (v3_instances.user_id) or any
+// listed collaborator may write; everyone else (incl. anonymous) is rejected with
+// 403 — but ONLY once the instance has an owner set. Legacy owner-less instances
+// stay open for backward compatibility (same rule as direct feasibilities).
+async function checkInstancePermission(sql, instanceId, userid) {
+  const [inst] = await sql.unsafe(
+    `SELECT id, user_id, collaborators FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`,
+    [instanceId],
+  );
+  if (!inst) return { ok: false, status: 404, error: "Instance not found" };
+  const owner = inst.user_id;
+  const collabs = Array.isArray(inst.collaborators) ? inst.collaborators : [];
+  const uid = userid == null ? null : String(userid);
+  const isOwner = !!(owner && uid && String(owner) === uid);
+  const isCollaborator = !!(uid && collabs.some((c) => String(c) === uid));
+  if (owner && !isOwner && !isCollaborator) {
+    return { ok: false, status: 403, error: "You are not authorized to edit this instance.", inst };
+  }
+  return { ok: true, inst, isOwner, isCollaborator };
+}
+
 export async function createInstance(req, res) {
   const sql = getSql();
   const b = req.body || {};
   if (!b.template_id) return res.status(400).json({ error: "template_id required" });
+  // Require a logged-in user — no anonymous report creation. The created
+  // instance is owned by this user (which then locks editing to them).
+  const ownerId = requesterId(req);
+  if (!ownerId) return res.status(401).json({ error: "Sign in required to create a report." });
 
   const [tpl] = await sql.unsafe(
     `SELECT id, name, published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
@@ -1770,7 +1802,7 @@ export async function createInstance(req, res) {
       `INSERT INTO ${T.v3_instances}
          (id, template_id, version_id, name, user_id)
        VALUES ($1, $2, $3, $4, $5)`,
-      [instanceId, b.template_id, versionId, instanceName, b.user_id ?? null],
+      [instanceId, b.template_id, versionId, instanceName, String(ownerId)],
     );
   } catch (e) {
     return res.status(500).json({ error: `Create instance failed: ${e.message}` });
@@ -1881,6 +1913,13 @@ export async function getInstance(req, res) {
 export async function patchInstance(req, res) {
   const sql = getSql();
   const b = req.body || {};
+  const perm = await checkInstancePermission(sql, req.params.id, requesterId(req));
+  if (!perm.ok) return res.status(perm.status).json({ error: perm.error });
+  // First authenticated edit of an owner-less instance claims ownership (locks it).
+  if (perm.inst && !perm.inst.user_id) {
+    const uid = requesterId(req);
+    if (uid) await sql.unsafe(`UPDATE ${T.v3_instances} SET user_id = $1 WHERE id = $2 AND user_id IS NULL`, [String(uid), req.params.id]);
+  }
   const fields = [
     ["name", "name"],
     ["collaborators", "collaborators"],
@@ -1917,6 +1956,8 @@ export async function patchInstance(req, res) {
 // Cascade-deletes the instance's MIs via FK ON DELETE CASCADE.
 export async function deleteInstance(req, res) {
   const sql = getSql();
+  const perm = await checkInstancePermission(sql, req.params.id, requesterId(req));
+  if (!perm.ok) return res.status(perm.status).json({ error: perm.error });
   const [row] = await sql.unsafe(
     `DELETE FROM ${T.v3_instances} WHERE id = $1 RETURNING id`,
     [req.params.id],
@@ -1986,6 +2027,14 @@ export async function patchInstanceMasterInput(req, res) {
     return res.status(400).json({ error: "value required" });
   }
   const { instanceId, templateMiId } = req.params;
+
+  const perm = await checkInstancePermission(sql, instanceId, requesterId(req));
+  if (!perm.ok) return res.status(perm.status).json({ error: perm.error });
+  // First authenticated edit of an owner-less instance claims ownership (locks it).
+  if (perm.inst && !perm.inst.user_id) {
+    const uid = requesterId(req);
+    if (uid) await sql.unsafe(`UPDATE ${T.v3_instances} SET user_id = $1 WHERE id = $2 AND user_id IS NULL`, [String(uid), instanceId]);
+  }
 
   // Cheap sanity check — confirm the template MI actually exists. Read its
   // `key` too so we can persist a key-keyed override row (id may change if

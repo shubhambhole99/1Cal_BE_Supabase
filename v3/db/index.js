@@ -1,13 +1,14 @@
 import { config } from "dotenv";
 config({ override: true });
 import postgres from "postgres";
+import { resolveDbUrl } from "../../db/resolveDbUrl.js";
 
 let _sql = null;
 
 /** Lazy-init postgres client. Use as: `await sql\`SELECT 1\`` */
 export function getSql() {
   if (!_sql) {
-    const url = process.env.DATABASE_URL;
+    const url = resolveDbUrl();
     if (!url) throw new Error("DATABASE_URL is not set");
     _sql = postgres(url, { prepare: false });
   }

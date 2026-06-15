@@ -3,13 +3,13 @@ config({ override: true });
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import * as model from "../schema/index.js";
+import { resolveDbUrl } from "./resolveDbUrl.js";
 
 let _db = null;
 
 function getDb() {
   if (!_db) {
-    const connectionString = process.env.DATABASE_URL;
-    console.log(connectionString)
+    const connectionString = resolveDbUrl();
     if (!connectionString) {
       throw new Error("DATABASE_URL is not set");
     }

@@ -2,6 +2,7 @@ import { config } from "dotenv";
 config({ override: true });
 import postgres from "postgres";
 import { newObjectId } from "../utils/objectId.js";
+import { resolveDbUrl } from "../../db/resolveDbUrl.js";
 
 const SCHEMA = process.env.DB_SCHEMA ?? "prod";
 const ref = (t) => (SCHEMA === "public" ? `"${t}"` : `"${SCHEMA}"."${t}"`);
@@ -20,7 +21,7 @@ const ref = (t) => (SCHEMA === "public" ? `"${t}"` : `"${SCHEMA}"."${t}"`);
  * `published_version_id`.
  */
 export async function ensureTables() {
-  const sql = postgres(process.env.DATABASE_URL, { prepare: false, max: 1 });
+  const sql = postgres(resolveDbUrl(), { prepare: false, max: 1 });
   try {
     if (SCHEMA !== "public") {
       await sql.unsafe(`CREATE SCHEMA IF NOT EXISTS "${SCHEMA}"`);
