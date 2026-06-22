@@ -1094,10 +1094,22 @@ export async function deletePage(req, res) {
 // ─── Version management ───────────────────────────────────────────────────────
 
 // GET /v3/templates/:id/versions
+// Version lineage column (forked_from_version_id) is added lazily so the
+// feature works even when ENSURE_TABLES=false. Guarded to run once per process.
+let _v3VerForkColEnsured = false;
+async function ensureVerForkCol(sql) {
+  if (_v3VerForkColEnsured) return;
+  try {
+    await sql.unsafe(`ALTER TABLE ${T.v3_versions} ADD COLUMN IF NOT EXISTS forked_from_version_id VARCHAR(24)`);
+  } catch {}
+  _v3VerForkColEnsured = true;
+}
+
 export async function listVersions(req, res) {
   const sql = getSql();
+  await ensureVerForkCol(sql);
   const rows = await sql.unsafe(
-    `SELECT id, label, notes, author_id, created_at FROM ${T.v3_versions}
+    `SELECT id, label, notes, author_id, created_at, forked_from_version_id FROM ${T.v3_versions}
      WHERE template_id = $1 ORDER BY created_at ASC`,
     [req.params.id],
   );
@@ -1138,12 +1150,15 @@ export async function createVersion(req, res) {
 
   const newVersionId = newObjectId();
   const finalLabel = (label && String(label).trim()) || `v${Date.now()}`;
+  await ensureVerForkCol(sql);
 
   try {
     await sql.begin(async (tx) => {
+      // forked_from_version_id records which version this copy was branched from,
+      // so the lineage ("this version started from version X") is traceable later.
       await tx.unsafe(
-        `INSERT INTO ${T.v3_versions} (id, template_id, label) VALUES ($1, $2, $3)`,
-        [newVersionId, templateId, finalLabel],
+        `INSERT INTO ${T.v3_versions} (id, template_id, label, forked_from_version_id) VALUES ($1, $2, $3, $4)`,
+        [newVersionId, templateId, finalLabel, sourceVersionId],
       );
 
       if (empty) {
@@ -1798,11 +1813,16 @@ export async function createInstance(req, res) {
     `${tpl.name || "Untitled"} — instance ${new Date().toISOString().slice(0, 10)}`;
 
   try {
+    // Remember which calculation this instance was created from, so its scheme
+    // can be re-resolved on every open (see getInstance). Idempotent column add
+    // works even when ENSURE_TABLES=false.
+    await sql.unsafe(`ALTER TABLE ${T.v3_instances} ADD COLUMN IF NOT EXISTS calculation_id VARCHAR(24)`).catch(() => {});
+    const calculationId = b.calculation_id ? String(b.calculation_id) : null;
     await sql.unsafe(
       `INSERT INTO ${T.v3_instances}
-         (id, template_id, version_id, name, user_id)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [instanceId, b.template_id, versionId, instanceName, String(ownerId)],
+         (id, template_id, version_id, name, user_id, calculation_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [instanceId, b.template_id, versionId, instanceName, String(ownerId), calculationId],
     );
   } catch (e) {
     return res.status(500).json({ error: `Create instance failed: ${e.message}` });
@@ -1889,6 +1909,58 @@ export async function getInstance(req, res) {
      ORDER BY ord ASC`,
     [inst.template_id, versionId],
   );
+
+  // ── Always reflect the owning calculation's scheme ──────────────────────
+  // On EVERY open (from /my-files, a direct link, anywhere), resolve which
+  // calculation this instance belongs to and apply that calc's prefill
+  // selections — notably the "Schemes" multiselect — onto the composed master
+  // inputs. RetemplateTwo computes page + master-input visibility from these
+  // values, so a 33(11) report always shows only 33(11) pages, regardless of
+  // what (if anything) was written at creation time.
+  try {
+    let calc = null;
+    if (inst.calculation_id) {
+      [calc] = await sql.unsafe(
+        `SELECT prefill_master_inputs FROM ${T.v3_calculations} WHERE id = $1 LIMIT 1`,
+        [inst.calculation_id],
+      );
+    }
+    if (!calc) {
+      // Fallback for instances created before calculation_id existed: instances
+      // are named "<calc name> — <date>", so match by re-template + name prefix
+      // (longest matching calc name wins, e.g. "33(11)" over "33(1)").
+      const cands = await sql.unsafe(
+        `SELECT name, prefill_master_inputs FROM ${T.v3_calculations} WHERE retemplate_id = $1`,
+        [inst.template_id],
+      );
+      const nm = String(inst.name || "");
+      let best = null;
+      for (const c of cands || []) {
+        const cn = String(c.name || "");
+        if (!cn) continue;
+        if (nm === cn || nm.startsWith(cn + " — ")) {
+          if (!best || cn.length > String(best.name || "").length) best = c;
+        }
+      }
+      calc = best;
+    }
+    if (calc && calc.prefill_master_inputs != null) {
+      const raw = calc.prefill_master_inputs;
+      const arr = Array.isArray(raw) ? raw : JSON.parse(String(raw) || "[]");
+      const byKey = new Map();
+      for (const p of Array.isArray(arr) ? arr : []) {
+        if (p && p.key) byKey.set(String(p.key), p.value == null ? null : String(p.value));
+      }
+      if (byKey.size) {
+        for (const mi of mis) {
+          if (byKey.has(mi.key)) mi.value = byKey.get(mi.key);
+        }
+      }
+    }
+  } catch (e) {
+    // Non-fatal: if calc resolution fails, fall back to the composed values.
+    console.error("[getInstance] scheme resolve failed:", e.message);
+  }
 
   res.json({
     instance: inst,
