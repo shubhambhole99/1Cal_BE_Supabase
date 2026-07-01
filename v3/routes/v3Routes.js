@@ -21,6 +21,7 @@ router.post("/templates/:id/versions/:targetVersionId/restore", ctrl.restoreVers
 router.patch("/templates/:id/versions/:versionId", ctrl.patchVersion);
 router.delete("/templates/:id/versions/:versionId", ctrl.deleteVersion);
 router.post("/templates/:id/publish", ctrl.publishVersion);
+router.post("/templates/:id/promote", ctrl.promoteToPublished);
 
 router.post("/pages", ctrl.createPage);
 router.post("/pages/reorder", ctrl.reorderPages);

@@ -22,6 +22,19 @@ import restrictedRoutes from "./routes/restrictedRoutes.js";
 import v3Routes from "./v3/routes/v3Routes.js";
 import { ensureTables as ensureV3Tables } from "./v3/db/ensureTables.js";
 
+// ── Crash backstops ─────────────────────────────────────────────────────────
+// A rejected promise in an async route handler that isn't caught would
+// otherwise abort the entire process (Node terminates on an unhandled
+// rejection). One bad request — e.g. a duplicate-key during a JSON restore —
+// must NOT take the server down for everyone. Log it and keep serving;
+// individual handlers still return proper 4xx/5xx where they can.
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+
 const app = express();
 
 // Body parsing with high limit for large template payloads (match BE).

@@ -1,0 +1,20 @@
+{
+  "name": "feasibility-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for editing 1Cal v3 feasibility templates (formulas, values, formatting, master inputs) over the BE /v3 API.",
+  "bin": {
+    "feasibility-mcp": "server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  }
+}

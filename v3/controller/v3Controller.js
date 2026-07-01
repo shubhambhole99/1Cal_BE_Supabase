@@ -24,6 +24,63 @@ const T = {
   legacy_templates: `"${SCHEMA}"."templates"`,
 };
 
+// ── JSONB read normalization ──────────────────────────────────────────────────
+// Several JSONB columns (master_input.options, page cells/styles/merges/
+// column_widths/row_heights/columns_order/schemes/print_settings, template
+// input_sections, instance collaborators/print_overrides) hold values that were
+// *double-encoded* at import/migration time — a JSON string was written into the
+// jsonb column. The driver unwraps one layer and hands back a STRING, so every
+// frontend that does `options.map(...)` / `column_widths?.[k]` / `Array.isArray
+// (input_sections)` breaks (`TypeError: (mi.options || []).map is not a function`).
+//
+// Parse those fields once on read. The guard only parses strings, so rows that
+// are already proper JSON (clean data) pass through untouched — safe whether the
+// underlying data is double-encoded or correct.
+function parseJsonbStr(value, fallback) {
+  if (value == null) return fallback;
+  if (typeof value !== "string") return value; // already parsed by the driver
+  try {
+    const parsed = JSON.parse(value);
+    return parsed == null ? fallback : parsed;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizePage(p) {
+  if (!p || typeof p !== "object") return p;
+  const out = { ...p };
+  if ("cells" in out) out.cells = parseJsonbStr(out.cells, {});
+  if ("styles" in out) out.styles = parseJsonbStr(out.styles, {});
+  if ("merges" in out) out.merges = parseJsonbStr(out.merges, []);
+  if ("column_widths" in out) out.column_widths = parseJsonbStr(out.column_widths, {});
+  if ("row_heights" in out) out.row_heights = parseJsonbStr(out.row_heights, {});
+  if ("columns_order" in out) out.columns_order = parseJsonbStr(out.columns_order, []);
+  if ("schemes" in out) out.schemes = parseJsonbStr(out.schemes, null);
+  if ("print_settings" in out) out.print_settings = parseJsonbStr(out.print_settings, null);
+  return out;
+}
+
+function normalizeMasterInput(mi) {
+  if (!mi || typeof mi !== "object") return mi;
+  return { ...mi, options: parseJsonbStr(mi.options, []) };
+}
+
+function normalizeTemplate(t) {
+  if (!t || typeof t !== "object") return t;
+  const out = { ...t };
+  if ("input_sections" in out) out.input_sections = parseJsonbStr(out.input_sections, []);
+  return out;
+}
+
+function normalizeInstance(inst) {
+  if (!inst || typeof inst !== "object") return inst;
+  const out = { ...inst };
+  if ("collaborators" in out) out.collaborators = parseJsonbStr(out.collaborators, []);
+  if ("print_overrides" in out) out.print_overrides = parseJsonbStr(out.print_overrides, null);
+  return out;
+}
+
 // Helper — resolve the version_id for a request: explicit ?version wins,
 // else the template's published_version_id.
 async function resolveVersionId(sql, templateId, explicit) {
@@ -407,7 +464,7 @@ export async function getTemplate(req, res) {
     [id],
   );
 
-  res.json({ ...tpl, pages, versions, active_version_id: versionId });
+  res.json({ ...normalizeTemplate(tpl), pages: pages.map(normalizePage), versions, active_version_id: versionId });
 }
 
 // ── POST /v3/pages/reorder ───────────────────────────────────────────────────
@@ -465,62 +522,83 @@ export async function createPage(req, res) {
   if (!b.template_id || !b.name) {
     return res.status(400).json({ error: "template_id and name required" });
   }
-  const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
-  if (!versionId) {
-    return res.status(400).json({ error: "Template has no published version yet" });
-  }
-  if (await isPublishedVersion(sql, b.template_id, versionId)) {
-    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
-  }
+  try {
+    const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
+    if (!versionId) {
+      return res.status(400).json({ error: "Template has no published version yet" });
+    }
+    if (await isPublishedVersion(sql, b.template_id, versionId)) {
+      return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+    }
 
-  let ord = b.ord;
-  if (!Number.isFinite(ord)) {
-    const [row] = await sql.unsafe(
-      `SELECT COALESCE(MAX(ord), -1) AS max_ord FROM ${T.v3_pages}
-       WHERE template_id = $1 AND version_id = $2`,
-      [b.template_id, versionId],
+    const nextFreeOrd = async () => {
+      const [row] = await sql.unsafe(
+        `SELECT COALESCE(MAX(ord), -1) AS max_ord FROM ${T.v3_pages}
+         WHERE template_id = $1 AND version_id = $2`,
+        [b.template_id, versionId],
+      );
+      return (row?.max_ord ?? -1) + 1;
+    };
+
+    let ord = Number.isFinite(b.ord) ? b.ord : await nextFreeOrd();
+    const id = newObjectId();
+    // Persist content fields on insert when the caller supplies them — the
+    // JSON-restore flow POSTs a page WITH its cells/styles/merges, and without
+    // this the restore would silently drop everything and the user would have
+    // to run it a second time (when the page already exists and PATCH lands
+    // the data). Default each one to a sane empty value when absent.
+    const insertWithOrd = (ordVal) =>
+      sql.unsafe(
+        `INSERT INTO ${T.v3_pages}
+           (id, template_id, version_id, name, ord, row_count, col_count,
+            hidden, cells, styles, merges, column_widths, row_heights, schemes,
+            freeze_rows, freeze_cols, print_settings)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+        [
+          id,
+          b.template_id,
+          versionId,
+          b.name,
+          ordVal,
+          Number.isFinite(b.row_count) ? b.row_count : 50,
+          Number.isFinite(b.col_count) ? b.col_count : 26,
+          typeof b.hidden === "boolean" ? b.hidden : false,
+          b.cells && typeof b.cells === "object" ? b.cells : {},
+          b.styles && typeof b.styles === "object" ? b.styles : {},
+          Array.isArray(b.merges) ? b.merges : [],
+          b.column_widths && typeof b.column_widths === "object" ? b.column_widths : {},
+          b.row_heights && typeof b.row_heights === "object" ? b.row_heights : {},
+          Array.isArray(b.schemes) ? b.schemes : [],
+          Number.isFinite(b.freeze_rows) ? Math.max(0, Math.min(20, Math.trunc(b.freeze_rows))) : 0,
+          Number.isFinite(b.freeze_cols) ? Math.max(0, Math.min(20, Math.trunc(b.freeze_cols))) : 0,
+          b.print_settings && typeof b.print_settings === "object" && !Array.isArray(b.print_settings) ? b.print_settings : {},
+        ],
+      );
+
+    try {
+      await insertWithOrd(ord);
+    } catch (e) {
+      // Duplicate (template_id, version_id, ord): the caller's requested ord is
+      // already taken — common when JSON-restore POSTs a backup page (ord 0..N)
+      // into a template that already has pages at those ords. Append at the next
+      // free ord and retry once instead of crashing the process.
+      if (e?.code === "23505" && /ord/.test(String(e?.constraint_name || ""))) {
+        ord = await nextFreeOrd();
+        await insertWithOrd(ord);
+      } else {
+        throw e;
+      }
+    }
+
+    const [page] = await sql.unsafe(
+      `SELECT * FROM ${T.v3_pages} WHERE id = $1 LIMIT 1`,
+      [id],
     );
-    ord = (row?.max_ord ?? -1) + 1;
+    res.status(201).json(page);
+  } catch (e) {
+    console.error("[createPage] error:", e?.message || e);
+    res.status(500).json({ error: String(e?.message || e) });
   }
-
-  const id = newObjectId();
-  // Persist content fields on insert when the caller supplies them — the
-  // JSON-restore flow POSTs a page WITH its cells/styles/merges, and without
-  // this the restore would silently drop everything and the user would have
-  // to run it a second time (when the page already exists and PATCH lands
-  // the data). Default each one to a sane empty value when absent.
-  await sql.unsafe(
-    `INSERT INTO ${T.v3_pages}
-       (id, template_id, version_id, name, ord, row_count, col_count,
-        hidden, cells, styles, merges, column_widths, row_heights, schemes,
-        freeze_rows, freeze_cols, print_settings)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
-    [
-      id,
-      b.template_id,
-      versionId,
-      b.name,
-      ord,
-      Number.isFinite(b.row_count) ? b.row_count : 50,
-      Number.isFinite(b.col_count) ? b.col_count : 26,
-      typeof b.hidden === "boolean" ? b.hidden : false,
-      b.cells && typeof b.cells === "object" ? b.cells : {},
-      b.styles && typeof b.styles === "object" ? b.styles : {},
-      Array.isArray(b.merges) ? b.merges : [],
-      b.column_widths && typeof b.column_widths === "object" ? b.column_widths : {},
-      b.row_heights && typeof b.row_heights === "object" ? b.row_heights : {},
-      Array.isArray(b.schemes) ? b.schemes : [],
-      Number.isFinite(b.freeze_rows) ? Math.max(0, Math.min(20, Math.trunc(b.freeze_rows))) : 0,
-      Number.isFinite(b.freeze_cols) ? Math.max(0, Math.min(20, Math.trunc(b.freeze_cols))) : 0,
-      b.print_settings && typeof b.print_settings === "object" && !Array.isArray(b.print_settings) ? b.print_settings : {},
-    ],
-  );
-
-  const [page] = await sql.unsafe(
-    `SELECT * FROM ${T.v3_pages} WHERE id = $1 LIMIT 1`,
-    [id],
-  );
-  res.status(201).json(page);
 }
 
 // ── GET /v3/pages/:id ──────────────────────────────────────────────────────────
@@ -532,7 +610,36 @@ export async function getPage(req, res) {
     [id],
   );
   if (!page) return res.status(404).json({ error: "Page not found" });
-  res.json(page);
+  res.json(normalizePage(page));
+}
+
+// ── Group name-reference helpers ──────────────────────────────────────────────
+// Master inputs are persisted with a `group_id` FK (the internal source of
+// truth, stable for FK integrity + version/instance id-remapping). The API
+// surface, however, references a group by its NAME via `group_key`, resolved
+// against the unique (template_id, version_id, section, key) tuple. These two
+// helpers translate at the edge so callers can work in names.
+async function resolveGroupId(sql, templateId, versionId, section, groupKey) {
+  if (groupKey == null || groupKey === "") return null;
+  const rows = await sql.unsafe(
+    `SELECT id FROM ${T.master_input_group}
+     WHERE template_id = $1
+       AND version_id IS NOT DISTINCT FROM $2
+       AND section IS NOT DISTINCT FROM $3
+       AND key = $4
+     LIMIT 1`,
+    [templateId, versionId ?? null, section ?? null, groupKey],
+  );
+  return rows[0]?.id ?? null;
+}
+
+async function groupKeyOf(sql, groupId) {
+  if (!groupId) return null;
+  const rows = await sql.unsafe(
+    `SELECT key FROM ${T.master_input_group} WHERE id = $1 LIMIT 1`,
+    [groupId],
+  );
+  return rows[0]?.key ?? null;
 }
 
 // ── GET /v3/templates/:id/master-inputs ────────────────────────────────────────
@@ -553,8 +660,14 @@ export async function getMasterInputs(req, res) {
      ORDER BY ord ASC`,
     [id, versionId],
   );
+  // Attach group_key (name-reference) from the already-loaded groups — no extra
+  // query. group_id stays on each row as the internal source of truth.
+  const idToKey = new Map(groups.map((g) => [g.id, g.key]));
   res.json({
-    masterInputs: rows,
+    masterInputs: rows.map((r) => ({
+      ...normalizeMasterInput(r),
+      group_key: r.group_id ? idToKey.get(r.group_id) ?? null : null,
+    })),
     masterInputGroups: groups,
     active_version_id: versionId,
   });
@@ -568,7 +681,9 @@ export async function getMasterInput(req, res) {
     [req.params.id],
   );
   if (!row) return res.status(404).json({ error: "Master input not found" });
-  res.json(row);
+  const out = normalizeMasterInput(row);
+  out.group_key = await groupKeyOf(sql, row.group_id);
+  res.json(out);
 }
 
 // ── POST /v3/master-inputs ────────────────────────────────────────────────────
@@ -588,6 +703,11 @@ export async function createMasterInput(req, res) {
   if (await isPublishedVersion(sql, b.template_id, versionId)) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
+  // Name-reference: if the caller passed a `group_key`, resolve it to the
+  // internal group_id. An explicit group_id (legacy callers) still works.
+  const groupId = Object.prototype.hasOwnProperty.call(b, "group_key")
+    ? await resolveGroupId(sql, b.template_id, versionId, b.section ?? null, b.group_key)
+    : (b.group_id ?? null);
   const id = newObjectId();
   await sql.unsafe(
     `INSERT INTO ${T.master_input}
@@ -606,7 +726,7 @@ export async function createMasterInput(req, res) {
       b.options ?? [],
       b.section ?? null,
       b.kind ?? "basic",
-      b.group_id ?? null,
+      groupId,
       Number.isFinite(b.ord) ? b.ord : 0,
     ],
   );
@@ -619,7 +739,7 @@ export async function createMasterInput(req, res) {
     reason: "mi.created",
     clientId: req.get("x-client-id") || null,
   });
-  res.status(201).json(row);
+  res.status(201).json({ ...row, group_key: await groupKeyOf(sql, row.group_id) });
 }
 
 // ── PATCH /v3/master-inputs/:id ───────────────────────────────────────────────
@@ -631,6 +751,18 @@ export async function patchMasterInput(req, res) {
   }
   if (await rowIsPublished(sql, T.master_input, req.params.id)) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
+  // Name-reference: a `group_key` in the body is the authoritative group
+  // reference. Resolve it to the internal group_id against the row's current
+  // section (group_key and section are never patched in the same request), then
+  // let it flow through the normal group_id update below.
+  if (Object.prototype.hasOwnProperty.call(b, "group_key")) {
+    const [cur] = await sql.unsafe(
+      `SELECT template_id, version_id, section FROM ${T.master_input} WHERE id = $1 LIMIT 1`,
+      [req.params.id],
+    );
+    if (!cur) return res.status(404).json({ error: "Master input not found" });
+    b.group_id = await resolveGroupId(sql, cur.template_id, cur.version_id, cur.section, b.group_key);
   }
   const fields = [
     ["key", "key"],
@@ -670,7 +802,7 @@ export async function patchMasterInput(req, res) {
     value: row.value,
     clientId: req.get("x-client-id") || null,
   });
-  res.json(row);
+  res.json({ ...row, group_key: await groupKeyOf(sql, row.group_id) });
 }
 
 // ── DELETE /v3/master-inputs/:id ──────────────────────────────────────────────
@@ -727,11 +859,24 @@ export async function createMasterInputGroup(req, res) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
   const id = newObjectId();
+  let row;
   try {
-    await sql.unsafe(
+    // UPSERT (not a plain INSERT) so re-adding a group whose previous row is
+    // still present — e.g. the client removed it but the DELETE hasn't been
+    // flushed yet in manual-save mode, or a delete/create race in auto-sync —
+    // revives the existing row instead of failing the unique constraint
+    // (template_id, version_id, section, key). On conflict the existing id is
+    // kept; the client cancels its pending delete for that id. Mirrors the
+    // bulk-create route's ON CONFLICT handling.
+    const rows = await sql.unsafe(
       `INSERT INTO ${T.master_input_group}
          (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (template_id, version_id, section, key) DO UPDATE
+         SET display_name = EXCLUDED.display_name,
+             ord = EXCLUDED.ord,
+             parent_group_id = EXCLUDED.parent_group_id
+       RETURNING *`,
       [
         id,
         b.template_id,
@@ -743,10 +888,10 @@ export async function createMasterInputGroup(req, res) {
         b.parent_group_id ?? null,
       ],
     );
+    row = rows[0];
   } catch (e) {
     return res.status(500).json({ error: `Create group failed: ${e.message}` });
   }
-  const [row] = await sql.unsafe(`SELECT * FROM ${T.master_input_group} WHERE id = $1`, [id]);
   broadcast({
     type: "masterInput.updated",
     templateId: row.template_id,
@@ -951,36 +1096,50 @@ export async function patchPage(req, res) {
   const params = [id];
   let i = 2;
 
+  // ── Legacy double-encoded jsonb guard (prevents page-wipe on save) ────────
+  // Some v3_pages rows store cells/styles/column_widths/row_heights as a
+  // DOUBLE-ENCODED jsonb STRING (a JSON string inside jsonb) rather than a jsonb
+  // object — a relic of the import/migration. Postgres `||` on (string || object)
+  // does NOT merge; it ARRAY-WRAPS into `[oldString, newObject]`. The FE then
+  // reads that array back as "no cells", so the entire page (inputs + layout)
+  // looks DELETED after the first save on a freshly-forked editable version.
+  // Normalize the column to a real object (one `#>> '{}'` peel) before every
+  // merge/subtract so the operation stays an object merge regardless of how the
+  // value was stored. Clean rows (already objects) pass through unchanged.
+  const asObj = (col) =>
+    `(CASE WHEN jsonb_typeof(${col}) = 'string' THEN (${col} #>> '{}')::jsonb ` +
+    `WHEN ${col} IS NULL THEN '{}'::jsonb ELSE ${col} END)`;
+
   // Combine cells merge + removeCells into a single SET to avoid Postgres
   // error 42601 "multiple assignments to same column" — happens when both
   // are sent in one PATCH (e.g. during a row/col shift).
   const hasCells = cells && typeof cells === "object";
   const hasRemoveCells = Array.isArray(removeCells) && removeCells.length > 0;
   if (hasCells && hasRemoveCells) {
-    updates.push(`cells = (cells || $${i}) - $${i + 1}::text[]`);
+    updates.push(`cells = (${asObj("cells")} || $${i}) - $${i + 1}::text[]`);
     params.push(cells, removeCells);
     i += 2;
   } else if (hasCells) {
-    updates.push(`cells = cells || $${i}`);
+    updates.push(`cells = ${asObj("cells")} || $${i}`);
     params.push(cells);
     i++;
   } else if (hasRemoveCells) {
-    updates.push(`cells = cells - $${i}::text[]`);
+    updates.push(`cells = ${asObj("cells")} - $${i}::text[]`);
     params.push(removeCells);
     i++;
   }
   const hasStyles = styles && typeof styles === "object";
   const hasRemoveStyles = Array.isArray(removeStyles) && removeStyles.length > 0;
   if (hasStyles && hasRemoveStyles) {
-    updates.push(`styles = (styles || $${i}) - $${i + 1}::text[]`);
+    updates.push(`styles = (${asObj("styles")} || $${i}) - $${i + 1}::text[]`);
     params.push(styles, removeStyles);
     i += 2;
   } else if (hasStyles) {
-    updates.push(`styles = styles || $${i}`);
+    updates.push(`styles = ${asObj("styles")} || $${i}`);
     params.push(styles);
     i++;
   } else if (hasRemoveStyles) {
-    updates.push(`styles = styles - $${i}::text[]`);
+    updates.push(`styles = ${asObj("styles")} - $${i}::text[]`);
     params.push(removeStyles);
     i++;
   }
@@ -1022,12 +1181,13 @@ export async function patchPage(req, res) {
   }
   if (column_widths && typeof column_widths === "object" && !Array.isArray(column_widths)) {
     // Merge into existing column_widths (same semantics as cells/styles).
-    updates.push(`column_widths = column_widths || $${i}`);
+    // asObj() guards the same double-encoded-string → array-wrap wipe.
+    updates.push(`column_widths = ${asObj("column_widths")} || $${i}`);
     params.push(column_widths);
     i++;
   }
   if (row_heights && typeof row_heights === "object" && !Array.isArray(row_heights)) {
-    updates.push(`row_heights = row_heights || $${i}`);
+    updates.push(`row_heights = ${asObj("row_heights")} || $${i}`);
     params.push(row_heights);
     i++;
   }
@@ -1502,6 +1662,236 @@ export async function publishVersion(req, res) {
   res.json(tpl);
 }
 
+// POST /v3/templates/:id/promote
+// Body: { sourceVersionId, targetVersionId, pages?: [name...], masterInputs?: [{key, section}...] }
+//
+// Selectively copies SPECIFIC pages and/or master inputs from a SOURCE version
+// (typically the editable draft) into a TARGET version (typically the published
+// one) WITHOUT republishing the whole version. Pages match by name; master
+// inputs by (key, section). This is the sanctioned way to push a single change
+// live, so it deliberately bypasses the published-lock the PATCH handlers
+// enforce. Returns a summary of what was updated / created / skipped.
+export async function promoteToPublished(req, res) {
+  const sql = getSql();
+  const { id: templateId } = req.params;
+  const b = req.body || {};
+  const { sourceVersionId, targetVersionId } = b;
+  const pageNames = Array.isArray(b.pages) ? b.pages.filter((n) => typeof n === "string") : [];
+  const mis = Array.isArray(b.masterInputs) ? b.masterInputs.filter((m) => m && m.key) : [];
+  // Whole-section promote. "—" is the UI placeholder for the no-section bucket;
+  // exclude it (those loose inputs are promoted individually).
+  const sectionNames = Array.isArray(b.sections)
+    ? b.sections.filter((s) => typeof s === "string" && s !== "—")
+    : [];
+
+  if (!sourceVersionId || !targetVersionId) {
+    return res.status(400).json({ error: "sourceVersionId and targetVersionId required" });
+  }
+  if (sourceVersionId === targetVersionId) {
+    return res.status(400).json({ error: "Source and target are the same version" });
+  }
+  if (pageNames.length === 0 && mis.length === 0 && sectionNames.length === 0) {
+    return res.status(400).json({ error: "Nothing to promote: provide pages, masterInputs and/or sections" });
+  }
+
+  try {
+    const [src] = await sql.unsafe(
+      `SELECT id FROM ${T.v3_versions} WHERE id = $1 AND template_id = $2 LIMIT 1`,
+      [sourceVersionId, templateId],
+    );
+    if (!src) return res.status(404).json({ error: "Source version not found" });
+    const [tgt] = await sql.unsafe(
+      `SELECT id FROM ${T.v3_versions} WHERE id = $1 AND template_id = $2 LIMIT 1`,
+      [targetVersionId, templateId],
+    );
+    if (!tgt) return res.status(404).json({ error: "Target version not found" });
+
+    const out = {
+      pages: { updated: [], created: [], missing: [] },
+      masterInputs: { updated: [], missing: [] },
+      sections: { promoted: [], empty: [] },
+    };
+
+    // ── Pages (match by name) ───────────────────────────────────────────────
+    for (const name of pageNames) {
+      const [srcPage] = await sql.unsafe(
+        `SELECT id FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2 AND name = $3 LIMIT 1`,
+        [templateId, sourceVersionId, name],
+      );
+      if (!srcPage) {
+        out.pages.missing.push(name);
+        continue;
+      }
+      // Overwrite the target page's CONTENT from the source (keep target's id,
+      // version_id, name and ord). One UPDATE…FROM matched by name.
+      const updated = await sql.unsafe(
+        `UPDATE ${T.v3_pages} t SET
+           row_count = s.row_count, col_count = s.col_count, size = s.size,
+           orientation = s.orientation, scale = s.scale, hidden = s.hidden,
+           is_imported = s.is_imported, columns_order = s.columns_order,
+           column_widths = s.column_widths, row_heights = s.row_heights,
+           cells = s.cells, styles = s.styles, merges = s.merges, schemes = s.schemes,
+           freeze_rows = s.freeze_rows, freeze_cols = s.freeze_cols,
+           print_settings = s.print_settings, updated_at = NOW()
+         FROM ${T.v3_pages} s
+         WHERE t.template_id = $1 AND t.version_id = $2 AND t.name = $4
+           AND s.template_id = $1 AND s.version_id = $3 AND s.name = $4
+         RETURNING t.id`,
+        [templateId, targetVersionId, sourceVersionId, name],
+      );
+      if (updated.length) {
+        out.pages.updated.push(name);
+        broadcast({ type: "page.updated", templateId, versionId: targetVersionId, pageId: updated[0].id, pageName: name });
+      } else {
+        // Target has no page with that name — create a copy at the next free ord.
+        const [{ max_ord }] = await sql.unsafe(
+          `SELECT COALESCE(MAX(ord), -1) AS max_ord FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2`,
+          [templateId, targetVersionId],
+        );
+        const newId = newObjectId();
+        await sql.unsafe(
+          `INSERT INTO ${T.v3_pages}
+             (id, template_id, version_id, name, ord, row_count, col_count, size, orientation, scale,
+              hidden, is_imported, columns_order, column_widths, row_heights, cells, styles, merges,
+              schemes, freeze_rows, freeze_cols, print_settings)
+           SELECT $4, template_id, $2::text, name, $5, row_count, col_count, size, orientation, scale,
+              hidden, is_imported, columns_order, column_widths, row_heights, cells, styles, merges,
+              schemes, freeze_rows, freeze_cols, print_settings
+           FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $3 AND name = $6`,
+          [templateId, targetVersionId, sourceVersionId, newId, (max_ord ?? -1) + 1, name],
+        );
+        out.pages.created.push(name);
+        broadcast({ type: "page.updated", templateId, versionId: targetVersionId, pageId: newId, pageName: name });
+      }
+    }
+
+    // ── Master inputs (match by key + section; UPDATE existing only) ─────────
+    // multiselect `options[].pages` hold page IDs that are version-scoped, so
+    // they're remapped source→target by page NAME during the copy.
+    for (const m of mis) {
+      const key = String(m.key);
+      const section = m.section == null ? null : String(m.section);
+      const updated = await sql.unsafe(
+        `UPDATE ${T.master_input} t SET
+           value = s.value, ref = s.ref, type = s.type,
+           display_name = s.display_name, kind = s.kind,
+           options = CASE
+             WHEN s.options IS NULL OR jsonb_typeof(s.options) <> 'array' THEN s.options
+             ELSE (
+               SELECT jsonb_agg(
+                 CASE WHEN jsonb_typeof(opt) = 'object' AND opt ? 'pages' THEN
+                   jsonb_set(opt, '{pages}', COALESCE(
+                     (SELECT jsonb_agg(tp.id)
+                      FROM jsonb_array_elements_text(opt->'pages') AS pid
+                      JOIN ${T.v3_pages} sp ON sp.id = pid AND sp.template_id = $1 AND sp.version_id = $3
+                      JOIN ${T.v3_pages} tp ON tp.name = sp.name AND tp.template_id = $1 AND tp.version_id = $2),
+                     '[]'::jsonb))
+                 ELSE opt END)
+               FROM jsonb_array_elements(s.options) AS opt)
+           END
+         FROM ${T.master_input} s
+         WHERE t.template_id = $1 AND t.version_id = $2 AND t.key = $4 AND COALESCE(t.section,'') = COALESCE($5,'')
+           AND s.template_id = $1 AND s.version_id = $3 AND s.key = $4 AND COALESCE(s.section,'') = COALESCE($5,'')
+         RETURNING t.id, t.key, t.ref, t.value`,
+        [templateId, targetVersionId, sourceVersionId, key, section],
+      );
+      if (updated.length) {
+        out.masterInputs.updated.push(key);
+        const r = updated[0];
+        broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId, masterInputId: r.id, key: r.key, ref: r.ref, value: r.value });
+      } else {
+        out.masterInputs.missing.push(key);
+      }
+    }
+
+    // ── Whole sections (replace the published section's groups + inputs with
+    // the draft's). Done as delete-then-reinsert inside ONE transaction per
+    // section so it stays atomic — handles edits, additions AND removals.
+    // Group ids are remapped deterministically (sha256(targetVer || srcId)) so
+    // each MI's group_id lines up with the freshly inserted group; multiselect
+    // options[].pages are remapped source→target by page NAME.
+    for (const section of sectionNames) {
+      // How much is in the SOURCE section (for the result + skip empties).
+      const [{ count: srcMiCount }] = await sql.unsafe(
+        `SELECT COUNT(*)::int AS count FROM ${T.master_input} WHERE template_id=$1 AND version_id=$2 AND COALESCE(section,'')=COALESCE($3,'')`,
+        [templateId, sourceVersionId, section],
+      );
+      const [{ count: srcGroupCount }] = await sql.unsafe(
+        `SELECT COUNT(*)::int AS count FROM ${T.master_input_group} WHERE template_id=$1 AND version_id=$2 AND COALESCE(section,'')=COALESCE($3,'')`,
+        [templateId, sourceVersionId, section],
+      );
+      if (srcMiCount === 0 && srcGroupCount === 0) {
+        out.sections.empty.push(section);
+        continue;
+      }
+
+      await sql.begin(async (tx) => {
+        // 1) Wipe the target section's inputs then groups (FK order).
+        await tx.unsafe(
+          `DELETE FROM ${T.master_input} WHERE template_id=$1 AND version_id=$2 AND COALESCE(section,'')=COALESCE($3,'')`,
+          [templateId, targetVersionId, section],
+        );
+        await tx.unsafe(
+          `DELETE FROM ${T.master_input_group} WHERE template_id=$1 AND version_id=$2 AND COALESCE(section,'')=COALESCE($3,'')`,
+          [templateId, targetVersionId, section],
+        );
+        // 2) Copy the source section's groups (id + parent_group_id remapped).
+        await tx.unsafe(
+          `INSERT INTO ${T.master_input_group}
+             (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+           SELECT
+             substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
+             g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
+             CASE WHEN g.parent_group_id IS NULL THEN NULL
+                  ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24) END
+           FROM ${T.master_input_group} g
+           WHERE g.template_id = $2 AND g.version_id = $3 AND COALESCE(g.section,'') = COALESCE($4,'')`,
+          [targetVersionId, templateId, sourceVersionId, section],
+        );
+        // 3) Copy the source section's inputs (group_id remapped to match the
+        //    inserted groups; options[].pages remapped to target pages by name).
+        await tx.unsafe(
+          `INSERT INTO ${T.master_input}
+             (id, template_id, version_id, key, value, ref, type, options,
+              section, ord, display_name, kind, group_id)
+           SELECT
+             substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
+             m.template_id, $1::text, m.key, m.value, m.ref, m.type,
+             CASE
+               WHEN m.options IS NULL OR jsonb_typeof(m.options) <> 'array' THEN m.options
+               ELSE (
+                 SELECT jsonb_agg(
+                   CASE WHEN jsonb_typeof(opt) = 'object' AND opt ? 'pages' THEN
+                     jsonb_set(opt, '{pages}', COALESCE(
+                       (SELECT jsonb_agg(tp.id)
+                        FROM jsonb_array_elements_text(opt->'pages') AS pid
+                        JOIN ${T.v3_pages} sp ON sp.id = pid AND sp.template_id = $2 AND sp.version_id = $3
+                        JOIN ${T.v3_pages} tp ON tp.name = sp.name AND tp.template_id = $2 AND tp.version_id = $1),
+                       '[]'::jsonb))
+                   ELSE opt END)
+                 FROM jsonb_array_elements(m.options) AS opt)
+             END AS options,
+             m.section, m.ord, m.display_name, m.kind,
+             CASE WHEN m.group_id IS NULL THEN NULL
+                  ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24) END
+           FROM ${T.master_input} m
+           WHERE m.template_id = $2 AND m.version_id = $3 AND COALESCE(m.section,'') = COALESCE($4,'')`,
+          [targetVersionId, templateId, sourceVersionId, section],
+        );
+      });
+
+      out.sections.promoted.push({ name: section, mis: srcMiCount, groups: srcGroupCount });
+      // One broadcast nudges any viewer of the published version to refetch MIs.
+      broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId, section });
+    }
+
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    console.error("[promoteToPublished] error:", e?.message || e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+}
+
 // PATCH /v3/templates/:id/versions/:versionId  { label?, notes? }
 // Edit a version's metadata — its label (rename) and/or its `notes` markdown
 // changelog. Content (pages/MIs) is untouched. Works for any version,
@@ -1744,7 +2134,7 @@ export async function listInstances(req, res) {
        LIMIT 500`,
     );
   }
-  res.json({ instances: rows });
+  res.json({ instances: rows.map(normalizeInstance) });
 }
 
 // POST /v3/instances
@@ -1963,17 +2353,17 @@ export async function getInstance(req, res) {
   }
 
   res.json({
-    instance: inst,
+    instance: normalizeInstance(inst),
     template: tpl ? {
       id: tpl.id,
       name: tpl.name,
       scheme: tpl.scheme,
       description: tpl.description,
-      input_sections: tpl.input_sections,
+      input_sections: parseJsonbStr(tpl.input_sections, []),
       published_version_id: tpl.published_version_id,
     } : null,
-    pages,
-    masterInputs: mis,
+    pages: pages.map(normalizePage),
+    masterInputs: mis.map(normalizeMasterInput),
     masterInputGroups: groups,
     active_version_id: versionId,
   });
@@ -2082,7 +2472,7 @@ export async function getInstanceMasterInputs(req, res) {
      ORDER BY tmi.ord ASC`,
     [id, inst.template_id, miVersionId],
   );
-  res.json({ masterInputs: rows });
+  res.json({ masterInputs: rows.map(normalizeMasterInput) });
 }
 
 // PATCH /v3/instances/:instanceId/master-inputs/:templateMiId
@@ -2155,7 +2545,7 @@ export async function patchInstanceMasterInput(req, res) {
      LIMIT 1`,
     [instanceId, templateMiId],
   );
-  res.json(row);
+  res.json(normalizeMasterInput(row));
 }
 
 // ── GET /v3/active-context ────────────────────────────────────────────────────
