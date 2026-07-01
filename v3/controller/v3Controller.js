@@ -287,12 +287,34 @@ export async function createTemplate(req, res) {
 export async function patchTemplate(req, res) {
   const sql = getSql();
   const b = req.body || {};
+
+  // ── page_groups is VERSION-scoped content now ──────────────────────────────
+  // It no longer lives on v3_templates. Route it to the active version's row
+  // (resolved from ?version= / body.version_id, else the published version) and
+  // strip it from the template-column update below. Written as an explicit
+  // array so an empty list persists as '[]' (user removed every group) rather
+  // than NULL (never set) — the read path in getTemplate depends on that.
+  let pgUpdate = null;
+  if (Object.prototype.hasOwnProperty.call(b, "page_groups")) {
+    const versionId = await resolveVersionId(sql, req.params.id, req.query.version ?? b.version_id);
+    if (!versionId) {
+      return res.status(400).json({ error: "Template has no version to attach page groups to" });
+    }
+    const pg = Array.isArray(b.page_groups) ? b.page_groups : [];
+    const [vrow] = await sql.unsafe(
+      `UPDATE ${T.v3_versions} SET page_groups = $1::jsonb
+         WHERE id = $2 AND template_id = $3 RETURNING id`,
+      [JSON.stringify(pg), versionId, req.params.id],
+    );
+    if (!vrow) return res.status(404).json({ error: "Version not found for this template" });
+    pgUpdate = { versionId, page_groups: pg };
+  }
+
   const fields = [
     ["name", "name"],
     ["scheme", "scheme"],
     ["description", "description"],
     ["input_sections", "input_sections"],
-    ["page_groups", "page_groups"],
     ["disabled", "disabled"],
     ["ord", "ord"],
     // Persisted pointer to the version the editor currently has open (the
@@ -310,25 +332,44 @@ export async function patchTemplate(req, res) {
       i++;
     }
   }
-  if (sets.length === 0) return res.status(400).json({ error: "No fields to update" });
-  sets.push(`updated_at = NOW()`);
-  const [row] = await sql.unsafe(
-    `UPDATE ${T.v3_templates} SET ${sets.join(", ")} WHERE id = $1 RETURNING *`,
-    params,
-  );
-  if (!row) return res.status(404).json({ error: "Template not found" });
+
+  let row;
+  if (sets.length > 0) {
+    sets.push(`updated_at = NOW()`);
+    [row] = await sql.unsafe(
+      `UPDATE ${T.v3_templates} SET ${sets.join(", ")} WHERE id = $1 RETURNING *`,
+      params,
+    );
+    if (!row) return res.status(404).json({ error: "Template not found" });
+  } else if (pgUpdate) {
+    // Only page_groups changed — fetch the current template row for the
+    // response / broadcast payload.
+    [row] = await sql.unsafe(`SELECT * FROM ${T.v3_templates} WHERE id = $1`, [req.params.id]);
+    if (!row) return res.status(404).json({ error: "Template not found" });
+  } else {
+    return res.status(400).json({ error: "No fields to update" });
+  }
+
   // Broadcast template metadata changes so open editors repaint without a
-  // manual reload. The page-group and input-section UIs in retemplate1
-  // listen for this event and patch `tpl` in place. We also surface which
-  // fields changed so listeners can skip irrelevant updates cheaply.
+  // manual reload. For page_groups we include the versionId + the new list so
+  // ONLY editors viewing that same version apply it (version-scoped now).
+  const changedFields = fields
+    .filter(([, key]) => Object.prototype.hasOwnProperty.call(b, key))
+    .map(([, key]) => key);
+  if (pgUpdate) changedFields.push("page_groups");
   broadcast({
     type: "template.updated",
     templateId: row.id,
-    fields: fields.filter(([, key]) => Object.prototype.hasOwnProperty.call(b, key)).map(([, key]) => key),
-    template: row,
+    fields: changedFields,
+    template: pgUpdate ? { ...row, page_groups: pgUpdate.page_groups } : row,
+    versionId: pgUpdate ? pgUpdate.versionId : null,
     clientId: req.get("x-client-id") || null,
   });
-  res.json(row);
+  res.json(
+    pgUpdate
+      ? { ...row, page_groups: pgUpdate.page_groups, active_version_id: pgUpdate.versionId }
+      : row,
+  );
 }
 
 // ── POST /v3/master-inputs/bulk ──────────────────────────────────────────────
@@ -464,7 +505,34 @@ export async function getTemplate(req, res) {
     [id],
   );
 
-  res.json({ ...normalizeTemplate(tpl), pages: pages.map(normalizePage), versions, active_version_id: versionId });
+  // Page groups are version-scoped: return the ACTIVE version's set, not the
+  // legacy template-level blob. Only fall back to the template column when the
+  // version's page_groups IS NULL (never set its own yet) — an explicit empty
+  // array means the user removed every group on this version and MUST be
+  // respected (don't resurrect the template's groups).
+  const tplPageGroups = Array.isArray(parseJsonbStr(tpl.page_groups, []))
+    ? parseJsonbStr(tpl.page_groups, [])
+    : [];
+  let pageGroups = tplPageGroups;
+  if (versionId) {
+    const [ver] = await sql.unsafe(
+      `SELECT page_groups FROM ${T.v3_versions} WHERE id = $1 LIMIT 1`,
+      [versionId],
+    );
+    if (ver && ver.page_groups != null) {
+      const verPg = parseJsonbStr(ver.page_groups, []);
+      pageGroups = Array.isArray(verPg) ? verPg : [];
+    }
+    // else: version has no groups of its own yet → keep template fallback.
+  }
+
+  res.json({
+    ...normalizeTemplate(tpl),
+    page_groups: pageGroups,
+    pages: pages.map(normalizePage),
+    versions,
+    active_version_id: versionId,
+  });
 }
 
 // ── POST /v3/pages/reorder ───────────────────────────────────────────────────
@@ -1440,6 +1508,24 @@ export async function createVersion(req, res) {
           [newVersionId, templateId, sourceVersionId],
         );
       }
+
+      // Page groups (version-scoped): a copied version inherits the source's
+      // set — membership is name-based (pageNames), stable across the fork, so
+      // no page-id remap is needed. A blank/empty version starts with none
+      // (explicit '[]', not NULL, so it doesn't fall back to the template blob).
+      if (empty || !sourceVersionId) {
+        await tx.unsafe(
+          `UPDATE ${T.v3_versions} SET page_groups = '[]'::jsonb WHERE id = $1`,
+          [newVersionId],
+        );
+      } else {
+        await tx.unsafe(
+          `UPDATE ${T.v3_versions} nv
+              SET page_groups = (SELECT sv.page_groups FROM ${T.v3_versions} sv WHERE sv.id = $2)
+            WHERE nv.id = $1`,
+          [newVersionId, sourceVersionId],
+        );
+      }
     });
   } catch (e) {
     return res.status(500).json({ error: `Create version failed: ${e.message}` });
@@ -1613,6 +1699,17 @@ export async function restoreVersion(req, res) {
       [targetVersionId, templateId, sourceVersionId],
     );
     emit({ phase: "mis", done: miCount, total: miCount });
+
+    // Page groups (version-scoped): replace the target's set with the source's.
+    // Name-based membership is stable across versions, so no page-id remap.
+    await sql.unsafe(
+      `UPDATE ${T.v3_versions} t
+          SET page_groups = COALESCE(
+                (SELECT s.page_groups FROM ${T.v3_versions} s WHERE s.id = $2),
+                '[]'::jsonb)
+        WHERE t.id = $1`,
+      [targetVersionId, sourceVersionId],
+    );
 
     emit({ phase: "done" });
     res.end();

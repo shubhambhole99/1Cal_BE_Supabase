@@ -377,6 +377,15 @@ export async function ensureTables() {
       `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS group_id VARCHAR(24)`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS input_sections JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS page_groups JSONB DEFAULT '[]'::jsonb`,
+      // Page groups are now VERSION-scoped content (like pages / master inputs /
+      // MI groups). Each version owns its own set. The legacy template-level
+      // `v3_templates.page_groups` column above is kept as the pre-migration
+      // source of truth and backfilled into every version in step 2c-quater.
+      // NO default: NULL means "this version has never set its own groups yet"
+      // (→ read falls back to the template blob), which is deliberately distinct
+      // from an explicit empty array '[]' meaning "user removed every group here"
+      // (→ respected, never re-filled). A DEFAULT '[]' would collapse those two.
+      `ALTER TABLE ${ref("v3_versions")} ADD COLUMN IF NOT EXISTS page_groups JSONB`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS published_version_id VARCHAR(24)`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS draft_version_id VARCHAR(24)`,
       // Per-version changelog / release notes (markdown), editable from the
@@ -401,6 +410,49 @@ export async function ensureTables() {
       `ALTER TABLE ${ref("v3_instance_master_input")} ADD COLUMN IF NOT EXISTS template_mi_key TEXT`,
     ];
     for (const s of colAdds) await sql.unsafe(s);
+
+    // 2c-quater. Backfill version-scoped page_groups from the legacy template
+    // column. Pre-migration, ALL versions of a template shared one page_groups
+    // blob on v3_templates, so seed every version that hasn't got its own copy
+    // yet with the template's — preserving exactly what each version showed
+    // before. After this, edits diverge per-version (the whole point of the
+    // migration). Idempotent AND safe against re-fill: it ONLY touches versions
+    // whose page_groups IS NULL (never set their own yet). A version the user
+    // has since emptied holds an explicit '[]' (not NULL), so this leaves it
+    // alone on every subsequent boot — deleted groups never come back.
+    // Membership is name-based (pageNames), stable across versions, so no
+    // page-id remap is needed here.
+    //  • array form: template.page_groups is a proper JSON array — copy as-is.
+    //    NB: guard with `<> '[]'::jsonb` (a total jsonb comparison) rather than
+    //    jsonb_array_length() — SQL doesn't guarantee the jsonb_typeof check
+    //    short-circuits, so calling array_length on a scalar-typed row (some
+    //    templates store page_groups double-encoded as a string) raises
+    //    "cannot get array length of a scalar" and aborts the whole migration.
+    await sql.unsafe(`
+      UPDATE ${ref("v3_versions")} v
+         SET page_groups = t.page_groups
+        FROM ${ref("v3_templates")} t
+       WHERE v.template_id = t.id
+         AND v.page_groups IS NULL
+         AND jsonb_typeof(t.page_groups) = 'array'
+         AND t.page_groups <> '[]'::jsonb
+    `);
+    //  • string form: some rows were double-encoded (a JSON string in the jsonb
+    //    column) at import time. Re-parse defensively; wrapped so a malformed
+    //    value can't abort the whole boot migration.
+    await sql.unsafe(`DO $$
+      BEGIN
+        UPDATE ${ref("v3_versions")} v
+           SET page_groups = (t.page_groups #>> '{}')::jsonb
+          FROM ${ref("v3_templates")} t
+         WHERE v.template_id = t.id
+           AND v.page_groups IS NULL
+           AND t.page_groups IS NOT NULL
+           AND jsonb_typeof(t.page_groups) = 'string'
+           AND length(t.page_groups #>> '{}') > 2;
+      EXCEPTION WHEN others THEN
+        RAISE NOTICE 'page_groups string backfill skipped: %', SQLERRM;
+      END $$`);
 
     // 2c-bis. Promote master-input "group" rows to v3_master_input_group and
     // backfill group_id on inputs. Safe to re-run: subsequent passes find no
