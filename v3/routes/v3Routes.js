@@ -32,6 +32,7 @@ router.delete("/pages/:id", ctrl.deletePage);
 router.get("/master-inputs/:id", ctrl.getMasterInput);
 router.post("/master-inputs", ctrl.createMasterInput);
 router.post("/master-inputs/bulk", ctrl.bulkCreateMasterInputs);
+router.post("/master-inputs/wipe", ctrl.wipeVersionMasterInputs);
 router.post("/master-inputs/reorder", ctrl.reorderMasterInputs);
 router.patch("/master-inputs/:id", ctrl.patchMasterInput);
 router.delete("/master-inputs/:id", ctrl.deleteMasterInput);

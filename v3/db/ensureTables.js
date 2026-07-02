@@ -532,17 +532,14 @@ export async function ensureTables() {
             REFERENCES ${ref("v3_instances")} (id)
             ON DELETE CASCADE;
         END IF;
-        -- Override rows reference template MIs. If the template MI is
-        -- deleted, drop its overrides too.
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint WHERE conname = 'v3_instance_master_input_template_mi_fk'
-        ) THEN
-          ALTER TABLE ${ref("v3_instance_master_input")}
-            ADD CONSTRAINT v3_instance_master_input_template_mi_fk
-            FOREIGN KEY (template_mi_id)
-            REFERENCES ${ref("v3_master_input")} (id)
-            ON DELETE CASCADE;
-        END IF;
+        -- NOTE: the legacy v3_instance_master_input_template_mi_fk (template_mi_id
+        -- → v3_master_input.id, ON DELETE CASCADE) is intentionally NOT (re)added
+        -- here. The override model now resolves by template_mi_key, and this FK is
+        -- explicitly DROPPED a few statements below (step 2d-bis). Re-adding it was
+        -- (a) pointless — immediately dropped — and (b) it ABORTED ensureTables on
+        -- any DB with orphan override rows (template_mi_id pointing at a since
+        -- deleted MI): "insert or update on table v3_instance_master_input violates
+        -- foreign key constraint". Leaving it out lets the migration complete.
       END $$`);
 
     // 2d. Indexes

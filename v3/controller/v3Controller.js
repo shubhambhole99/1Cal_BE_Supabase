@@ -390,38 +390,53 @@ export async function bulkCreateMasterInputs(req, res) {
   if (await isPublishedVersion(sql, b.template_id, versionId)) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
+  // Build every row up front, then INSERT them in multi-row batches — ONE
+  // round-trip per batch instead of one per row. With a remote DB (prod is in
+  // ap-southeast-2) the per-row loop was the entire cost: 100 rows = 100 RTTs.
   const ids = [];
+  const rows = [];
+  for (let i = 0; i < b.masterInputs.length; i++) {
+    const mi = b.masterInputs[i];
+    if (!mi || !mi.key) continue;
+    if (mi.type === "group") continue; // groups go through /v3/master-input-groups/bulk
+    const id = newObjectId();
+    ids.push(id);
+    rows.push([
+      id,
+      b.template_id,
+      versionId,
+      mi.key,
+      mi.display_name ?? null,
+      mi.value == null ? null : String(mi.value),
+      mi.ref ?? null,
+      mi.type ?? "text",
+      mi.options ?? [],
+      mi.section ?? null,
+      mi.kind ?? "basic",
+      mi.group_id ?? null,
+      Number.isFinite(mi.ord) ? mi.ord : i,
+    ]);
+  }
+
+  const COLS = 13;
+  const BATCH = 1000; // 13 cols × 1000 = 13k binds, well under Postgres' 65535 cap
   try {
-    await sql.begin(async (tx) => {
-      for (let i = 0; i < b.masterInputs.length; i++) {
-        const mi = b.masterInputs[i];
-        if (!mi || !mi.key) continue;
-        if (mi.type === "group") continue; // groups are inserted via /v3/master-input-groups/bulk
-        const id = newObjectId();
-        ids.push(id);
-        await tx.unsafe(
-          `INSERT INTO ${T.master_input}
-             (id, template_id, version_id, key, display_name, value, ref, type, options,
-              section, kind, group_id, ord)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-          [
-            id,
-            b.template_id,
-            versionId,
-            mi.key,
-            mi.display_name ?? null,
-            mi.value == null ? null : String(mi.value),
-            mi.ref ?? null,
-            mi.type ?? "text",
-            mi.options ?? [],
-            mi.section ?? null,
-            mi.kind ?? "basic",
-            mi.group_id ?? null,
-            Number.isFinite(mi.ord) ? mi.ord : i,
-          ],
-        );
-      }
-    });
+    for (let off = 0; off < rows.length; off += BATCH) {
+      const slice = rows.slice(off, off + BATCH);
+      const tuples = slice
+        .map(
+          (_, r) =>
+            `(${Array.from({ length: COLS }, (_, c) => `$${r * COLS + c + 1}`).join(",")})`,
+        )
+        .join(",");
+      await sql.unsafe(
+        `INSERT INTO ${T.master_input}
+           (id, template_id, version_id, key, display_name, value, ref, type, options,
+            section, kind, group_id, ord)
+         VALUES ${tuples}`,
+        slice.flat(),
+      );
+    }
   } catch (e) {
     return res.status(500).json({ error: `Bulk create failed: ${e.message}` });
   }
@@ -434,6 +449,35 @@ export async function bulkCreateMasterInputs(req, res) {
     clientId: req.get("x-client-id") || null,
   });
   res.status(201).json({ count: ids.length, ids });
+}
+
+// ── POST /v3/master-inputs/wipe ───────────────────────────────────────────────
+// Body: { template_id, version_id? } — delete every master-input in that
+// (template, version) in ONE statement. Restore/import calls this before a fresh
+// bulk-insert so it doesn't fire thousands of per-row DELETE round-trips.
+export async function wipeVersionMasterInputs(req, res) {
+  const sql = getSql();
+  const { template_id, version_id } = req.body || {};
+  if (!template_id) return res.status(400).json({ error: "template_id required" });
+  const versionId = await resolveVersionId(sql, template_id, version_id);
+  if (await isPublishedVersion(sql, template_id, versionId)) {
+    return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+  }
+  const del = await sql.unsafe(
+    `DELETE FROM ${T.master_input}
+       WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
+    [template_id, versionId ?? null],
+  );
+  const count = del.count ?? 0;
+  broadcast({
+    type: "masterInput.updated",
+    templateId: template_id,
+    versionId,
+    reason: "mis.wiped",
+    count,
+    clientId: req.get("x-client-id") || null,
+  });
+  res.json({ count });
 }
 
 // ── POST /v3/master-inputs/reorder ────────────────────────────────────────────
