@@ -2,6 +2,7 @@ import { config } from "dotenv";
 config({ override: true });
 import { sql } from "drizzle-orm";
 import express from "express";
+import compression from "compression";
 import { db } from "./db/index.js";
 import { ensureTables } from "./db/ensureTables.js";
 
@@ -16,7 +17,6 @@ import contactRoutes from "./routes/contactRoutes.js";
 import billRoutes from "./routes/billRoutes.js";
 import aboutUsRoutes from "./routes/aboutUsRoutes.js";
 import commentRoutes from "./routes/commentRoutes.js";
-import restrictedRoutes from "./routes/restrictedRoutes.js";
 
 // v3 module (merged from BE 2 — self-contained under ./v3/*)
 import v3Routes from "./v3/routes/v3Routes.js";
@@ -36,6 +36,11 @@ process.on("uncaughtException", (err) => {
 });
 
 const app = express();
+
+// gzip/deflate responses. Instance/template payloads are large JSON (several MB
+// of cells/styles) — compressing them shrinks the wire transfer ~10x, which is
+// the dominant cost for clients on a real network. threshold:1KB skips tiny bodies.
+app.use(compression({ threshold: 1024 }));
 
 // Body parsing with high limit for large template payloads (match BE).
 // Note: On Vercel, request body is limited to 4.5MB; larger payloads need direct upload to storage.
@@ -88,7 +93,6 @@ app.use("/contact", contactRoutes);
 app.use("/bill", billRoutes);
 app.use("/aboutus", aboutUsRoutes);
 app.use("/comments", commentRoutes);
-app.use("/restricted", restrictedRoutes);
 app.use("/v3", v3Routes);
 
 // Error handling

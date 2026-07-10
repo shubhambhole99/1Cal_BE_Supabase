@@ -22,6 +22,8 @@ router.patch("/templates/:id/versions/:versionId", ctrl.patchVersion);
 router.delete("/templates/:id/versions/:versionId", ctrl.deleteVersion);
 router.post("/templates/:id/publish", ctrl.publishVersion);
 router.post("/templates/:id/promote", ctrl.promoteToPublished);
+router.post("/templates/:id/push-to-published/preview", ctrl.pushToPublishedPreview);
+router.post("/templates/:id/push-to-published", ctrl.pushToPublished);
 
 router.post("/pages", ctrl.createPage);
 router.post("/pages/reorder", ctrl.reorderPages);
@@ -64,9 +66,22 @@ router.post("/active-context", ctrl.setActiveContext);
 router.get("/calculations", ctrl.listCalculations);
 // Reorder before :id so the literal route wins the match.
 router.post("/calculations/reorder", ctrl.reorderCalculations);
+router.get("/calculations/applicable", ctrl.applicableCalculations);
 router.get("/calculations/:id", ctrl.getCalculation);
 router.post("/calculations", ctrl.createCalculation);
 router.patch("/calculations/:id", ctrl.patchCalculation);
+
+// Mumbai DCPR workflow — rules, evaluation, and run tracking.
+router.get("/dcpr/rules", ctrl.listDcprRules);
+router.put("/dcpr/rules", ctrl.saveDcprRules);
+router.get("/dcpr/graph", ctrl.getDcprGraph);
+router.put("/dcpr/graph", ctrl.saveDcprGraph);
+router.get("/dcpr/schemes", ctrl.evaluateDcprSchemes);
+router.get("/dcpr/runs", ctrl.listDcprRuns);
+// Literal segment before :id so it isn't captured as an id.
+router.get("/dcpr/runs/by-instance/:instanceId", ctrl.getDcprRunByInstance);
+router.post("/dcpr/runs", ctrl.createDcprRun);
+router.patch("/dcpr/runs/:id", ctrl.updateDcprRun);
 // DELETE route intentionally removed — use PATCH { disabled: true } instead.
 
 export default router;

@@ -84,6 +84,7 @@ export async function ensureTables() {
       paths: "jsonb",
       status: "varchar(64) DEFAULT 'active'",
       is_disabled: "boolean DEFAULT false",
+      can_create_v2: "boolean DEFAULT false",
       phone_country_code: "varchar(16)",
       phone_number: "varchar(32)",
       first_name: "text",

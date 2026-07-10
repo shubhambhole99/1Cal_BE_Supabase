@@ -19,6 +19,9 @@ const T = {
   v3_versions: `"${SCHEMA}"."v3_versions"`,
   v3_vdiffs: `"${SCHEMA}"."v3_version_diffs"`,
   v3_calculations: `"${SCHEMA}"."v3_calculations"`,
+  dcpr_rules: `"${SCHEMA}"."mumbai_dcpr_workflow_rules"`,
+  dcpr_runs: `"${SCHEMA}"."mumbai_dcpr_workflow_runs"`,
+  dcpr_graph: `"${SCHEMA}"."mumbai_dcpr_workflow_graph"`,
   projects: `"${SCHEMA}"."projects"`,
   active_context: `"${SCHEMA}"."active_context"`,
   legacy_templates: `"${SCHEMA}"."templates"`,
@@ -158,7 +161,7 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
   await tx.unsafe(
     `INSERT INTO ${T.master_input}
        (id, template_id, version_id, key, value, ref, type, options,
-        section, ord, display_name, kind, group_id)
+        section, ord, display_name, kind, group_id, default_value)
      SELECT
        substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
        m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -188,7 +191,8 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
        m.section, m.ord, m.display_name, m.kind,
        CASE WHEN m.group_id IS NULL THEN NULL
             ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
-       END
+       END,
+       m.default_value
      FROM ${T.master_input} m
      WHERE m.template_id = $2 AND m.version_id = $3`,
     [newVersionId, templateId, sourceVersionId],
@@ -415,10 +419,15 @@ export async function bulkCreateMasterInputs(req, res) {
       mi.kind ?? "basic",
       mi.group_id ?? null,
       Number.isFinite(mi.ord) ? mi.ord : i,
+      // default_value preserved on restore/import; multiselect excluded (NULL →
+      // falls back to value). Older exports without it seed default == value.
+      mi.default_value == null
+        ? (mi.type === "multiselect" ? null : (mi.value == null ? null : String(mi.value)))
+        : String(mi.default_value),
     ]);
   }
 
-  const COLS = 13;
+  const COLS = 14;
   const BATCH = 1000; // 13 cols × 1000 = 13k binds, well under Postgres' 65535 cap
   try {
     for (let off = 0; off < rows.length; off += BATCH) {
@@ -432,7 +441,7 @@ export async function bulkCreateMasterInputs(req, res) {
       await sql.unsafe(
         `INSERT INTO ${T.master_input}
            (id, template_id, version_id, key, display_name, value, ref, type, options,
-            section, kind, group_id, ord)
+            section, kind, group_id, ord, default_value)
          VALUES ${tuples}`,
         slice.flat(),
       );
@@ -824,8 +833,8 @@ export async function createMasterInput(req, res) {
   await sql.unsafe(
     `INSERT INTO ${T.master_input}
        (id, template_id, version_id, key, display_name, value, ref, type, options,
-        section, kind, group_id, ord)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        section, kind, group_id, ord, default_value)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
     [
       id,
       b.template_id,
@@ -840,6 +849,9 @@ export async function createMasterInput(req, res) {
       b.kind ?? "basic",
       groupId,
       Number.isFinite(b.ord) ? b.ord : 0,
+      // New instances seed from default_value. multiselect is excluded (stays
+      // NULL → falls back to value); other types start with default == value.
+      b.type === "multiselect" ? null : (b.default_value ?? b.value ?? null),
     ],
   );
   const [row] = await sql.unsafe(`SELECT * FROM ${T.master_input} WHERE id = $1`, [id]);
@@ -880,6 +892,7 @@ export async function patchMasterInput(req, res) {
     ["key", "key"],
     ["display_name", "display_name"],
     ["value", "value"],
+    ["default_value", "default_value"],
     ["ref", "ref"],
     ["type", "type"],
     ["options", "options"],
@@ -1516,7 +1529,7 @@ export async function createVersion(req, res) {
         await tx.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id)
+              section, ord, display_name, kind, group_id, default_value)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -1546,7 +1559,8 @@ export async function createVersion(req, res) {
              m.section, m.ord, m.display_name, m.kind,
              CASE WHEN m.group_id IS NULL THEN NULL
                   ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
-             END
+             END,
+             m.default_value
            FROM ${T.master_input} m
            WHERE m.template_id = $2 AND m.version_id = $3`,
           [newVersionId, templateId, sourceVersionId],
@@ -1714,7 +1728,7 @@ export async function restoreVersion(req, res) {
     await sql.unsafe(
       `INSERT INTO ${T.master_input}
          (id, template_id, version_id, key, value, ref, type, options,
-          section, ord, display_name, kind, group_id)
+          section, ord, display_name, kind, group_id, default_value)
        SELECT
          substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
          m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -1737,7 +1751,8 @@ export async function restoreVersion(req, res) {
          m.section, m.ord, m.display_name, m.kind,
          CASE WHEN m.group_id IS NULL THEN NULL
               ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
-         END
+         END,
+         m.default_value
        FROM ${T.master_input} m
        WHERE m.template_id = $2 AND m.version_id = $3`,
       [targetVersionId, templateId, sourceVersionId],
@@ -1914,7 +1929,7 @@ export async function promoteToPublished(req, res) {
       const section = m.section == null ? null : String(m.section);
       const updated = await sql.unsafe(
         `UPDATE ${T.master_input} t SET
-           value = s.value, ref = s.ref, type = s.type,
+           value = s.value, default_value = s.default_value, ref = s.ref, type = s.type,
            display_name = s.display_name, kind = s.kind,
            options = CASE
              WHEN s.options IS NULL OR jsonb_typeof(s.options) <> 'array' THEN s.options
@@ -1994,7 +2009,7 @@ export async function promoteToPublished(req, res) {
         await tx.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id)
+              section, ord, display_name, kind, group_id, default_value)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -2014,7 +2029,8 @@ export async function promoteToPublished(req, res) {
              END AS options,
              m.section, m.ord, m.display_name, m.kind,
              CASE WHEN m.group_id IS NULL THEN NULL
-                  ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24) END
+                  ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24) END,
+             m.default_value
            FROM ${T.master_input} m
            WHERE m.template_id = $2 AND m.version_id = $3 AND COALESCE(m.section,'') = COALESCE($4,'')`,
           [targetVersionId, templateId, sourceVersionId, section],
@@ -2029,6 +2045,149 @@ export async function promoteToPublished(req, res) {
     res.json({ ok: true, ...out });
   } catch (e) {
     console.error("[promoteToPublished] error:", e?.message || e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+}
+
+// POST /v3/templates/:id/push-to-published
+// Body: { sourceVersionId }
+// One-click "Push to Publish": syncs EVERYTHING from the given (editable) source
+// version into the template's live published version — every page, every whole
+// section (groups + MIs, including removals) and every loose master input. The
+// published pointer does NOT move: its version id stays the same, so instance
+// print-overrides and instance MI value overrides (keyed by stable MI key)
+// survive; the source version stays editable. Implemented by enumerating the
+// source's content and delegating to promoteToPublished — the sanctioned,
+// lock-bypassing sync path — so there is one code path for "push changes live".
+export async function pushToPublished(req, res) {
+  const sql = getSql();
+  const { id: templateId } = req.params;
+  const { sourceVersionId } = req.body || {};
+  if (!sourceVersionId) return res.status(400).json({ error: "sourceVersionId required" });
+
+  const [tpl] = await sql.unsafe(
+    `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+    [templateId],
+  );
+  const targetVersionId = tpl?.published_version_id || null;
+  if (!targetVersionId) {
+    return res.status(400).json({ error: "Template has no published version to push to" });
+  }
+  if (sourceVersionId === targetVersionId) {
+    return res.status(400).json({ error: "This version is already the published version" });
+  }
+
+  // Enumerate everything on the source (edit) version.
+  const pages = (
+    await sql.unsafe(
+      `SELECT name FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2 ORDER BY ord ASC`,
+      [templateId, sourceVersionId],
+    )
+  ).map((r) => r.name).filter((n) => typeof n === "string");
+  const sections = (
+    await sql.unsafe(
+      `SELECT DISTINCT section FROM ${T.master_input}
+        WHERE template_id = $1 AND version_id = $2 AND section IS NOT NULL AND section <> ''`,
+      [templateId, sourceVersionId],
+    )
+  ).map((r) => r.section);
+  // Loose (no-section) master inputs are promoted individually by (key, section).
+  const masterInputs = (
+    await sql.unsafe(
+      `SELECT key, section FROM ${T.master_input}
+        WHERE template_id = $1 AND version_id = $2 AND (section IS NULL OR section = '')`,
+      [templateId, sourceVersionId],
+    )
+  ).map((r) => ({ key: r.key, section: r.section ?? null }));
+
+  if (pages.length === 0 && sections.length === 0 && masterInputs.length === 0) {
+    return res.status(400).json({ error: "Nothing to push — the source version is empty" });
+  }
+
+  // Delegate to the existing, tested promote path with the full lists.
+  req.body = { sourceVersionId, targetVersionId, pages, sections, masterInputs };
+  return promoteToPublished(req, res);
+}
+
+// POST /v3/templates/:id/push-to-published/preview  { sourceVersionId }
+// Diffs the (editable) source version against the live published version and
+// returns what Push to Publish WOULD change — so the UI can say "no changes"
+// when they're identical, or summarise the diff otherwise. Compares only the
+// content fields Push actually syncs and that are NOT version-scoped ids:
+// page cells/styles/merges + dimensions, and MI value/default_value/ref/type/
+// display_name/kind. (MI options + group_id embed version-scoped page/group ids
+// remapped per version, so they'd false-positive and are intentionally skipped.)
+export async function pushToPublishedPreview(req, res) {
+  const sql = getSql();
+  const { id: templateId } = req.params;
+  const { sourceVersionId } = req.body || {};
+  if (!sourceVersionId) return res.status(400).json({ error: "sourceVersionId required" });
+
+  const [tpl] = await sql.unsafe(
+    `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+    [templateId],
+  );
+  const targetVersionId = tpl?.published_version_id || null;
+  if (!targetVersionId) return res.status(400).json({ error: "Template has no published version" });
+
+  const empty = { hasChanges: false, samePublished: sourceVersionId === targetVersionId, pages: { changed: [], added: [], removed: [] }, masterInputs: { changed: [], added: [], removed: [] } };
+  if (sourceVersionId === targetVersionId) return res.json(empty);
+
+  try {
+    // Pages — matched by name.
+    const pageRows = await sql.unsafe(
+      `SELECT
+         COALESCE(s.name, t.name) AS name,
+         (s.name IS NOT NULL) AS in_src,
+         (t.name IS NOT NULL) AS in_tgt,
+         (s.name IS NOT NULL AND t.name IS NOT NULL AND (
+            s.cells IS DISTINCT FROM t.cells OR s.styles IS DISTINCT FROM t.styles OR
+            s.merges IS DISTINCT FROM t.merges OR s.row_count IS DISTINCT FROM t.row_count OR
+            s.col_count IS DISTINCT FROM t.col_count OR s.column_widths IS DISTINCT FROM t.column_widths OR
+            s.row_heights IS DISTINCT FROM t.row_heights OR s.hidden IS DISTINCT FROM t.hidden OR
+            s.print_settings IS DISTINCT FROM t.print_settings
+         )) AS changed
+       FROM (SELECT * FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2) s
+       FULL OUTER JOIN (SELECT * FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $3) t
+         ON s.name = t.name`,
+      [templateId, sourceVersionId, targetVersionId],
+    );
+    const pages = { changed: [], added: [], removed: [] };
+    for (const r of pageRows) {
+      if (r.in_src && !r.in_tgt) pages.added.push(r.name);
+      else if (!r.in_src && r.in_tgt) pages.removed.push(r.name);
+      else if (r.changed) pages.changed.push(r.name);
+    }
+
+    // Master inputs — matched by (key, section).
+    const miRows = await sql.unsafe(
+      `SELECT
+         COALESCE(s.key, t.key) AS key,
+         (s.id IS NOT NULL) AS in_src,
+         (t.id IS NOT NULL) AS in_tgt,
+         (s.id IS NOT NULL AND t.id IS NOT NULL AND (
+            s.value IS DISTINCT FROM t.value OR s.default_value IS DISTINCT FROM t.default_value OR
+            s.ref IS DISTINCT FROM t.ref OR s.type IS DISTINCT FROM t.type OR
+            s.display_name IS DISTINCT FROM t.display_name OR s.kind IS DISTINCT FROM t.kind
+         )) AS changed
+       FROM (SELECT * FROM ${T.master_input} WHERE template_id = $1 AND version_id = $2) s
+       FULL OUTER JOIN (SELECT * FROM ${T.master_input} WHERE template_id = $1 AND version_id = $3) t
+         ON s.key = t.key AND COALESCE(s.section,'') = COALESCE(t.section,'')`,
+      [templateId, sourceVersionId, targetVersionId],
+    );
+    const masterInputs = { changed: [], added: [], removed: [] };
+    for (const r of miRows) {
+      if (r.in_src && !r.in_tgt) masterInputs.added.push(r.key);
+      else if (!r.in_src && r.in_tgt) masterInputs.removed.push(r.key);
+      else if (r.changed) masterInputs.changed.push(r.key);
+    }
+
+    const hasChanges =
+      pages.changed.length + pages.added.length + pages.removed.length +
+      masterInputs.changed.length + masterInputs.added.length + masterInputs.removed.length > 0;
+    res.json({ hasChanges, samePublished: false, pages, masterInputs });
+  } catch (e) {
+    console.error("[pushToPublishedPreview] error:", e?.message || e);
     res.status(500).json({ error: String(e?.message || e) });
   }
 }
@@ -2421,7 +2580,7 @@ export async function getInstance(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
-        COALESCE(imi.value, tmi.value) AS value
+        COALESCE(imi.value, tmi.default_value, tmi.value) AS value
      FROM ${T.master_input} tmi
      LEFT JOIN ${T.instance_mi} imi
        ON imi.instance_id = $1
@@ -2600,7 +2759,7 @@ export async function getInstanceMasterInputs(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
-        COALESCE(imi.value, tmi.value) AS value
+        COALESCE(imi.value, tmi.default_value, tmi.value) AS value
      FROM ${T.master_input} tmi
      LEFT JOIN ${T.instance_mi} imi
        ON imi.instance_id = $1
@@ -2674,7 +2833,7 @@ export async function patchInstanceMasterInput(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
-        COALESCE(imi.value, tmi.value) AS value
+        COALESCE(imi.value, tmi.default_value, tmi.value) AS value
      FROM ${T.master_input} tmi
      LEFT JOIN ${T.instance_mi} imi
        ON imi.instance_id = $1
@@ -2743,12 +2902,293 @@ export async function setActiveContext(req, res) {
 
 // ── Real Estate calculations ──────────────────────────────────────────────────
 
+// GET /v3/calculations/applicable?land_title=&plot_area= — schemes whose
+// report-workflow rule matches the chosen land title + plot area. Drives the
+// report workflow's Step 3: a scheme applies when its applicable_land_titles
+// contains the land title AND the plot area falls within its (nullable) range.
+export async function applicableCalculations(req, res) {
+  const sql = getSql();
+  const landTitle = String(req.query?.land_title || "").trim();
+  // Land-title values are distinct, non-substring tokens (MHADA / SOCIETY /
+  // SLUM_SRA). Sanitise to those chars so the LIKE below can't be injected.
+  const safe = landTitle.replace(/[^A-Za-z0-9_]/g, "");
+  const locality = String(req.query?.locality || "").trim();
+  const safeLoc = locality.replace(/[^A-Za-z0-9_]/g, "");
+  const raw = req.query?.plot_area;
+  const plotArea = raw == null || raw === "" || isNaN(Number(raw)) ? null : Number(raw);
+  if (!safe) return res.json({ calculations: [] });
+  try {
+    const rows = await sql.unsafe(
+      `SELECT id, name, description, sector, retemplate_id, prefill_master_inputs,
+              applicable_land_titles, applicable_localities, min_plot_area, max_plot_area
+       FROM ${T.v3_calculations}
+       WHERE disabled = FALSE
+         -- These jsonb columns round-trip double-encoded (like prefill_master_inputs),
+         -- so match on the text form — robust to both array and stringified encodings.
+         -- Land-title / locality values are distinct, non-substring tokens.
+         AND applicable_land_titles::text LIKE $1
+         AND applicable_localities::text LIKE $3
+         AND ($2::numeric IS NULL OR min_plot_area IS NULL OR $2::numeric >= min_plot_area)
+         AND ($2::numeric IS NULL OR max_plot_area IS NULL OR $2::numeric <= max_plot_area)
+       ORDER BY ord ASC, created_at DESC`,
+      [`%${safe}%`, plotArea, `%${safeLoc}%`],
+    );
+    res.json({ calculations: rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// ── Mumbai DCPR workflow (rules + runs) ──────────────────────────────────────
+// Persisted decision tree: a rule maps a (land_title, locality, plot-area range)
+// to a set of scheme calculation ids. `dcpr_workflow_runs` records every
+// completed run and the V3 instance (report) it produced.
+
+// GET /v3/dcpr/rules — all rules (admin load + frontend run).
+export async function listDcprRules(_req, res) {
+  const sql = getSql();
+  try {
+    const rows = await sql.unsafe(
+      `SELECT id, land_title, locality, min_plot_area, max_plot_area, scheme_calculation_ids, ord
+       FROM ${T.dcpr_rules} ORDER BY land_title ASC, ord ASC, created_at ASC`,
+    );
+    res.json({
+      rules: Array.from(rows).map((r) => ({
+        ...r,
+        scheme_calculation_ids: parseJsonbStr(r.scheme_calculation_ids, []),
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/dcpr/rules — replace all rules for one land title.
+// body: { land_title, rules: [{ locality, min_plot_area, max_plot_area, scheme_calculation_ids }] }
+export async function saveDcprRules(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  const landTitle = String(b.land_title || "").trim();
+  if (!landTitle) return res.status(400).json({ error: "land_title is required" });
+  const rules = Array.isArray(b.rules) ? b.rules : [];
+  try {
+    await sql.unsafe(`DELETE FROM ${T.dcpr_rules} WHERE land_title = $1`, [landTitle]);
+    let ord = 0;
+    for (const r of rules) {
+      await sql.unsafe(
+        `INSERT INTO ${T.dcpr_rules}
+           (id, land_title, locality, min_plot_area, max_plot_area, scheme_calculation_ids, ord)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
+        [
+          newObjectId(),
+          landTitle,
+          r.locality ? String(r.locality) : null,
+          r.min_plot_area === "" || r.min_plot_area == null ? null : Number(r.min_plot_area),
+          r.max_plot_area === "" || r.max_plot_area == null ? null : Number(r.max_plot_area),
+          JSON.stringify(Array.isArray(r.scheme_calculation_ids) ? r.scheme_calculation_ids : []),
+          ord++,
+        ],
+      );
+    }
+    res.json({ ok: true, land_title: landTitle, count: rules.length });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/dcpr/schemes?land_title=&locality=&plot_area= — evaluate the rules.
+// A rule matches when land_title equals, locality matches (or the rule's
+// locality is null = any), and the plot area is in [min, max) — nulls unbounded.
+export async function evaluateDcprSchemes(req, res) {
+  const sql = getSql();
+  const landTitle = String(req.query?.land_title || "").trim();
+  const locality = String(req.query?.locality || "").trim() || null;
+  const rawPlot = req.query?.plot_area;
+  const plot = rawPlot == null || rawPlot === "" || isNaN(Number(rawPlot)) ? null : Number(rawPlot);
+  if (!landTitle) return res.json({ schemes: [] });
+  try {
+    const rules = await sql.unsafe(
+      `SELECT scheme_calculation_ids FROM ${T.dcpr_rules}
+       WHERE land_title = $1
+         AND (locality IS NULL OR locality = $2)
+         AND (min_plot_area IS NULL OR ($3::numeric IS NOT NULL AND $3::numeric >= min_plot_area))
+         AND (max_plot_area IS NULL OR ($3::numeric IS NOT NULL AND $3::numeric < max_plot_area))
+       ORDER BY ord ASC`,
+      [landTitle, locality, plot],
+    );
+    const ids = [];
+    for (const r of Array.from(rules)) {
+      for (const cid of parseJsonbStr(r.scheme_calculation_ids, [])) {
+        if (!ids.includes(cid)) ids.push(cid);
+      }
+    }
+    if (!ids.length) return res.json({ schemes: [] });
+    const calcs = await sql.unsafe(
+      `SELECT id, name, retemplate_id, prefill_master_inputs, hide_v3, disabled
+       FROM ${T.v3_calculations} WHERE id = ANY($1)`,
+      [ids],
+    );
+    const byId = new Map(Array.from(calcs).map((c) => [c.id, c]));
+    const schemes = ids
+      .map((cid) => byId.get(cid))
+      .filter(Boolean)
+      .map((c) => ({
+        calculation_id: c.id,
+        name: c.name,
+        retemplate_id: c.retemplate_id,
+        prefill_master_inputs: c.prefill_master_inputs,
+        hide_v3: c.hide_v3,
+        disabled: c.disabled,
+      }));
+    res.json({ schemes });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// POST /v3/dcpr/runs — record a workflow run. Called the moment a user starts
+// a new report (status defaults to 'started'); the row is then PATCHed as they
+// progress and again when the V3 report (instance) is opened.
+export async function createDcprRun(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    const [row] = await sql.unsafe(
+      `INSERT INTO ${T.dcpr_runs}
+         (id, user_id, username, status, land_title, locality, plot_area, scheme_calculation_id, scheme_name, instance_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id, user_id, username, status, land_title, locality, plot_area, scheme_calculation_id, scheme_name, instance_id, created_at, updated_at`,
+      [
+        newObjectId(),
+        b.user_id ? String(b.user_id) : null,
+        b.username ? String(b.username) : null,
+        b.status ? String(b.status) : "started",
+        b.land_title ? String(b.land_title) : null,
+        b.locality ? String(b.locality) : null,
+        b.plot_area === "" || b.plot_area == null ? null : Number(b.plot_area),
+        b.scheme_calculation_id ? String(b.scheme_calculation_id) : null,
+        b.scheme_name ? String(b.scheme_name) : null,
+        b.instance_id ? String(b.instance_id) : null,
+      ],
+    );
+    res.status(201).json(row);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PATCH /v3/dcpr/runs/:id — update a run as it progresses (land title, plot,
+// locality, chosen scheme, produced instance, status). Only provided fields
+// are touched; updated_at is always bumped.
+export async function updateDcprRun(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    const sets = [];
+    const vals = [];
+    let i = 1;
+    const add = (col, val) => { sets.push(`${col} = $${i++}`); vals.push(val); };
+
+    if ("land_title" in b) add("land_title", b.land_title ? String(b.land_title) : null);
+    if ("locality" in b) add("locality", b.locality ? String(b.locality) : null);
+    if ("plot_area" in b) add("plot_area", b.plot_area === "" || b.plot_area == null ? null : Number(b.plot_area));
+    if ("scheme_calculation_id" in b) add("scheme_calculation_id", b.scheme_calculation_id ? String(b.scheme_calculation_id) : null);
+    if ("scheme_name" in b) add("scheme_name", b.scheme_name ? String(b.scheme_name) : null);
+    if ("instance_id" in b) add("instance_id", b.instance_id ? String(b.instance_id) : null);
+    if ("status" in b) add("status", b.status ? String(b.status) : null);
+
+    sets.push(`updated_at = NOW()`);
+    vals.push(req.params.id);
+
+    const [row] = await sql.unsafe(
+      `UPDATE ${T.dcpr_runs} SET ${sets.join(", ")}
+       WHERE id = $${i}
+       RETURNING id, user_id, username, status, land_title, locality, plot_area, scheme_calculation_id, scheme_name, instance_id, created_at, updated_at`,
+      vals,
+    );
+    if (!row) return res.status(404).json({ error: "not found" });
+    res.json(row);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/dcpr/runs — recent runs (who started what, and which reports resulted).
+export async function listDcprRuns(_req, res) {
+  const sql = getSql();
+  try {
+    const rows = await sql.unsafe(
+      `SELECT id, user_id, username, status, land_title, locality, plot_area, scheme_calculation_id, scheme_name, instance_id, created_at, updated_at
+       FROM ${T.dcpr_runs} ORDER BY created_at DESC LIMIT 500`,
+    );
+    res.json({ runs: Array.from(rows) });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/dcpr/runs/by-instance/:instanceId — the workflow run (if any) that
+// produced this V3 instance. Lets the report page know it was created from a
+// Mumbai DCPR workflow and recover the workflow context (land title, plot,
+// locality, scheme) so it can auto-continue the guided flow. Returns
+// { run: null } when the instance wasn't created from a workflow.
+export async function getDcprRunByInstance(req, res) {
+  const sql = getSql();
+  try {
+    const [row] = await sql.unsafe(
+      `SELECT id, user_id, username, status, land_title, locality, plot_area, scheme_calculation_id, scheme_name, instance_id, created_at, updated_at
+       FROM ${T.dcpr_runs}
+       WHERE instance_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [req.params.instanceId],
+    );
+    res.json({ run: row || null });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/dcpr/graph — the saved decision-tree (React Flow nodes + edges).
+export async function getDcprGraph(_req, res) {
+  const sql = getSql();
+  try {
+    const [row] = await sql.unsafe(
+      `SELECT payload, updated_at FROM ${T.dcpr_graph} WHERE id = 'current' LIMIT 1`,
+    );
+    const raw = row?.payload;
+    const graph = typeof raw === "string" ? JSON.parse(raw || "null") : (raw || null);
+    res.json({ graph: graph && graph.nodes ? graph : null, updated_at: row?.updated_at || null });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/dcpr/graph — save the decision-tree { nodes, edges }.
+export async function saveDcprGraph(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  const graph = { nodes: Array.isArray(b.nodes) ? b.nodes : [], edges: Array.isArray(b.edges) ? b.edges : [] };
+  try {
+    const [row] = await sql.unsafe(
+      `INSERT INTO ${T.dcpr_graph} (id, payload, updated_at)
+       VALUES ('current', $1::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+       RETURNING updated_at`,
+      [JSON.stringify(graph)],
+    );
+    res.json({ ok: true, updated_at: row?.updated_at || null });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
 // GET /v3/calculations/:id — single
 export async function getCalculation(req, res) {
   const sql = getSql();
   try {
     const [row] = await sql.unsafe(
-      `SELECT id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, created_at, updated_at
+      `SELECT id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, hide_v3, applicable_land_titles, applicable_localities, min_plot_area, max_plot_area, created_at, updated_at
        FROM ${T.v3_calculations}
        WHERE id = $1
        LIMIT 1`,
@@ -2767,7 +3207,7 @@ export async function listCalculations(_req, res) {
   const sql = getSql();
   try {
     const rows = await sql.unsafe(`
-      SELECT id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, created_at, updated_at
+      SELECT id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, hide_v3, applicable_land_titles, applicable_localities, min_plot_area, max_plot_area, created_at, updated_at
       FROM ${T.v3_calculations}
       ORDER BY ord ASC, created_at DESC
       LIMIT 500
@@ -2795,7 +3235,7 @@ export async function createCalculation(req, res) {
     const [row] = await sql.unsafe(
       `INSERT INTO ${T.v3_calculations} (id, name, description, sector, author, ord, template_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, created_at, updated_at`,
+       RETURNING id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, hide_v3, applicable_land_titles, applicable_localities, min_plot_area, max_plot_area, created_at, updated_at`,
       [id, String(b.name).trim(), b.description ?? null, b.sector ?? null, b.author ?? null, nextOrd, b.template_id ?? null],
     );
     res.status(201).json(row);
@@ -2820,6 +3260,11 @@ export async function patchCalculation(req, res) {
   if (b.template_id !== undefined) { fields.push(`template_id = $${i++}`); args.push(b.template_id || null); }
   if (b.instance_id !== undefined) { fields.push(`instance_id = $${i++}`); args.push(b.instance_id || null); }
   if (b.retemplate_id !== undefined) { fields.push(`retemplate_id = $${i++}`); args.push(b.retemplate_id || null); }
+  if (b.hide_v3 !== undefined) { fields.push(`hide_v3 = $${i++}`); args.push(Boolean(b.hide_v3)); }
+  if (b.applicable_land_titles !== undefined) { fields.push(`applicable_land_titles = $${i++}::jsonb`); args.push(JSON.stringify(Array.isArray(b.applicable_land_titles) ? b.applicable_land_titles : [])); }
+  if (b.applicable_localities !== undefined) { fields.push(`applicable_localities = $${i++}::jsonb`); args.push(JSON.stringify(Array.isArray(b.applicable_localities) ? b.applicable_localities : [])); }
+  if (b.min_plot_area !== undefined) { fields.push(`min_plot_area = $${i++}`); args.push(b.min_plot_area === null || b.min_plot_area === "" ? null : Number(b.min_plot_area)); }
+  if (b.max_plot_area !== undefined) { fields.push(`max_plot_area = $${i++}`); args.push(b.max_plot_area === null || b.max_plot_area === "" ? null : Number(b.max_plot_area)); }
   if (b.prefill_master_inputs !== undefined) { fields.push(`prefill_master_inputs = $${i++}::jsonb`); args.push(JSON.stringify(Array.isArray(b.prefill_master_inputs) ? b.prefill_master_inputs : [])); }
   if (fields.length === 0) return res.status(400).json({ error: "no fields to update" });
   fields.push(`updated_at = NOW()`);
@@ -2828,7 +3273,7 @@ export async function patchCalculation(req, res) {
     const [row] = await sql.unsafe(
       `UPDATE ${T.v3_calculations} SET ${fields.join(", ")}
        WHERE id = $${i}
-       RETURNING id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, created_at, updated_at`,
+       RETURNING id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, hide_v3, applicable_land_titles, applicable_localities, min_plot_area, max_plot_area, created_at, updated_at`,
       args,
     );
     if (!row) return res.status(404).json({ error: "not found" });

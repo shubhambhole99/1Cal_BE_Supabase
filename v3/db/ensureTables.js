@@ -173,6 +173,36 @@ export async function ensureTables() {
       group_id        VARCHAR(24)
     )`);
 
+    // ── default_value: the STABLE per-instance seed ─────────────────────────
+    // `value` is the LIVE value retemplate1 uses for its own preview (it gets
+    // mutated freely during testing). `default_value` is what NEW instances
+    // fall back to, so test-mutating `value` never leaks into instances.
+    // Composition uses COALESCE(imi.value, tmi.default_value, tmi.value).
+    // One-time backfill — ONLY the first time the column is created — snapshots
+    // current non-multiselect values as their default. multiselect stays NULL
+    // (the default-value feature is intentionally excluded for it) and therefore
+    // falls through to `value`, i.e. unchanged behaviour.
+    {
+      const hadDefaultValue = await sql.unsafe(
+        `SELECT 1 FROM information_schema.columns
+          WHERE table_schema = '${SCHEMA}'
+            AND table_name  = 'v3_master_input'
+            AND column_name = 'default_value'
+          LIMIT 1`,
+      );
+      await sql.unsafe(
+        `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS default_value TEXT`,
+      );
+      if (!hadDefaultValue.length) {
+        await sql.unsafe(
+          `UPDATE ${ref("v3_master_input")}
+              SET default_value = value
+            WHERE COALESCE(type, '') <> 'multiselect'
+              AND value IS NOT NULL`,
+        );
+      }
+    }
+
     // Groups are first-class — they live in their own table and a master
     // input's group_id is a real FK. parent_group_id is reserved for nested
     // groups (no UI yet, schema-ready).
@@ -273,12 +303,64 @@ export async function ensureTables() {
     // populated with these values right after creation. Shape:
     //   [ { id: <template_mi_id>, key: <stable key>, value: <string> }, ... ]
     await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS prefill_master_inputs JSONB DEFAULT '[]'::jsonb`);
+    // `hide_v3` lets an admin hide the "Create Report by V3" button on a
+    // specific calculation's detail page even when a re-template is attached.
+    await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS hide_v3 BOOLEAN NOT NULL DEFAULT FALSE`);
+    // Report-workflow applicability — which land titles a scheme applies to and
+    // the plot-area (sq. m) range it's valid for. Drives Step 3 of the report
+    // workflow; empty land-titles = not offered until an admin configures it.
+    await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS applicable_land_titles JSONB DEFAULT '[]'::jsonb`);
+    // Which locality (CITY = Island City / SUBURB = Suburbs) a scheme applies to.
+    await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS applicable_localities JSONB DEFAULT '[]'::jsonb`);
+    await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS min_plot_area NUMERIC`);
+    await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS max_plot_area NUMERIC`);
 
     // `ord` + `disabled` on v3_templates power the admin Re-Template
     // listing's drag-to-reorder + disable-toggle UI (mirrors the
     // v3_calculations chrome).
     await sql.unsafe(`ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS ord INTEGER NOT NULL DEFAULT 0`);
     await sql.unsafe(`ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT FALSE`);
+
+    // Mumbai DCPR workflow — strictly for Mumbai DCPR (hence the mumbai_ prefix).
+    // Rules: (land_title, locality, plot-area range) → scheme calculation ids.
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("mumbai_dcpr_workflow_rules")} (
+      id                     VARCHAR(24) PRIMARY KEY,
+      land_title             VARCHAR(32) NOT NULL,
+      locality               VARCHAR(16),
+      min_plot_area          NUMERIC,
+      max_plot_area          NUMERIC,
+      scheme_calculation_ids JSONB DEFAULT '[]'::jsonb,
+      ord                    INTEGER NOT NULL DEFAULT 0,
+      created_at             TIMESTAMPTZ DEFAULT NOW(),
+      updated_at             TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    // Runs: one row per started workflow. Created the moment a user starts a
+    // new report (status 'started'), then updated as they progress and finally
+    // when the V3 report (instance) is opened (status 'completed').
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("mumbai_dcpr_workflow_runs")} (
+      id                    VARCHAR(24) PRIMARY KEY,
+      user_id               VARCHAR(24),
+      land_title            VARCHAR(32),
+      locality              VARCHAR(16),
+      plot_area             NUMERIC,
+      scheme_calculation_id VARCHAR(24),
+      scheme_name           TEXT,
+      instance_id           VARCHAR(24),
+      created_at            TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    // Progress-tracking columns (added after the fact — idempotent on existing DBs).
+    const dcprRunsTbl = ref("mumbai_dcpr_workflow_runs");
+    await sql.unsafe(`ALTER TABLE ${dcprRunsTbl} ADD COLUMN IF NOT EXISTS status     VARCHAR(16) DEFAULT 'started'`);
+    await sql.unsafe(`ALTER TABLE ${dcprRunsTbl} ADD COLUMN IF NOT EXISTS username   TEXT`);
+    await sql.unsafe(`ALTER TABLE ${dcprRunsTbl} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
+    // Workflow graph: the visual decision tree drawn in the admin builder
+    // (React Flow nodes + edges). Singleton row keyed 'current'.
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("mumbai_dcpr_workflow_graph")} (
+      id         TEXT PRIMARY KEY,
+      payload    JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
 
     // Projects — minimal placeholder for the upcoming MCGM-map → feasibility
     // integration. Will likely grow (ward/village/CTS/geometry); for now we

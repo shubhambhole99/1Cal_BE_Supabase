@@ -12,6 +12,9 @@ export const users = finalSchema.table("users", {
   paths: jsonb("paths"),
   status: varchar("status", { length: 64 }).default("active"),
   isDisabled: boolean("is_disabled").default(false),
+  // Per-user gate: when true, this user sees the "Create Report · V2" button
+  // on calculation pages. Hidden for everyone by default; admins grant it per user.
+  canCreateV2: boolean("can_create_v2").default(false),
   phoneCountryCode: varchar("phone_country_code", { length: 16 }),
   phoneNumber: varchar("phone_number", { length: 32 }),
   firstName: text("first_name"),
