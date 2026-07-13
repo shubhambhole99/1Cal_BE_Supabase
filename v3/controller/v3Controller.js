@@ -2733,6 +2733,79 @@ export async function patchInstance(req, res) {
   res.json(row);
 }
 
+// POST /v3/instances/:id/copy
+// Body: { user_id?, name? }
+//
+// Duplicates an instance — the row PLUS every master-input override — into a
+// brand-new instance OWNED BY THE REQUESTER. Pages/formulas/groups are NOT
+// copied; like the source they read through the template_id FK. The copy starts
+// with NO collaborators (a private clone) and carries over calculation_id +
+// print_overrides. Any logged-in user who can view the source may copy it (the
+// copy is theirs and never mutates the source). Returns the new instance row.
+export async function copyInstance(req, res) {
+  const sql = getSql();
+  const srcId = req.params.id;
+  const requester = requesterId(req);
+  if (!requester) return res.status(401).json({ error: "Sign in required to copy a report." });
+
+  const [src] = await sql.unsafe(
+    `SELECT * FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`,
+    [srcId],
+  );
+  if (!src) return res.status(404).json({ error: "Instance not found" });
+
+  const newId = newObjectId();
+  const newName =
+    (req.body?.name && String(req.body.name).trim()) ||
+    `${src.name || "Untitled"} (Copy)`;
+  // print_overrides comes back as a raw JSON string from the driver; pass it
+  // through, or NULL → '{}' if the source had none.
+  const printOv =
+    src.print_overrides == null
+      ? null
+      : typeof src.print_overrides === "string"
+        ? src.print_overrides
+        : JSON.stringify(src.print_overrides);
+
+  try {
+    // Parity with createInstance — calculation_id may be missing on old DBs.
+    await sql.unsafe(`ALTER TABLE ${T.v3_instances} ADD COLUMN IF NOT EXISTS calculation_id VARCHAR(24)`).catch(() => {});
+
+    // 1) Clone the instance row (new id + owner, fresh collaborators).
+    await sql.unsafe(
+      `INSERT INTO ${T.v3_instances}
+         (id, template_id, version_id, name, user_id, calculation_id, collaborators, print_overrides)
+       VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, COALESCE($7::jsonb, '{}'::jsonb))`,
+      [newId, src.template_id, src.version_id ?? null, newName, String(requester), src.calculation_id ?? null, printOv],
+    );
+
+    // 2) Clone every master-input override (the edited values) in one insert.
+    const overrides = await sql.unsafe(
+      `SELECT template_mi_id, template_mi_key, value FROM ${T.instance_mi} WHERE instance_id = $1`,
+      [srcId],
+    );
+    if (overrides.length) {
+      const placeholders = [];
+      const params = [];
+      let p = 1;
+      for (const o of overrides) {
+        placeholders.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
+        params.push(newObjectId(), newId, o.template_mi_id, o.template_mi_key, o.value);
+      }
+      await sql.unsafe(
+        `INSERT INTO ${T.instance_mi} (id, instance_id, template_mi_id, template_mi_key, value)
+         VALUES ${placeholders.join(", ")}`,
+        params,
+      );
+    }
+  } catch (e) {
+    return res.status(500).json({ error: `Copy instance failed: ${e.message}` });
+  }
+
+  const [row] = await sql.unsafe(`SELECT * FROM ${T.v3_instances} WHERE id = $1`, [newId]);
+  res.status(201).json(row);
+}
+
 // DELETE /v3/instances/:id
 // Cascade-deletes the instance's MIs via FK ON DELETE CASCADE.
 export async function deleteInstance(req, res) {

@@ -53,6 +53,7 @@ router.post("/instances", ctrl.createInstance);
 router.get("/instances/:id", ctrl.getInstance);
 router.patch("/instances/:id", ctrl.patchInstance);
 router.delete("/instances/:id", ctrl.deleteInstance);
+router.post("/instances/:id/copy", ctrl.copyInstance);
 router.get("/instances/:id/master-inputs", ctrl.getInstanceMasterInputs);
 router.patch("/instances/:instanceId/master-inputs/:templateMiId", ctrl.patchInstanceMasterInput);
 
