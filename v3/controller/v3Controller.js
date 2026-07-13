@@ -552,11 +552,22 @@ export async function getTemplate(req, res) {
     [id, versionId],
   );
 
-  const versions = await sql.unsafe(
-    `SELECT id, label, notes, author_id, created_at FROM ${T.v3_versions}
+  await ensureVerForkCol(sql);
+  const versionRows = await sql.unsafe(
+    `SELECT id, label, notes, author_id, created_at, forked_from_version_id FROM ${T.v3_versions}
      WHERE template_id = $1 ORDER BY created_at ASC`,
     [id],
   );
+  // Attach each version's SOURCE label — the label of the version it was forked
+  // from — so the version list can show "Forked from <label>". Every version of
+  // the template is in this set, so resolve the id→label map in-memory (no JOIN).
+  const versionLabelById = new Map(versionRows.map((r) => [r.id, r.label]));
+  const versions = versionRows.map((r) => ({
+    ...r,
+    source_label: r.forked_from_version_id
+      ? versionLabelById.get(r.forked_from_version_id) || null
+      : null,
+  }));
 
   // Page groups are version-scoped: return the ACTIVE version's set, not the
   // legacy template-level blob. Only fall back to the template column when the
@@ -1398,12 +1409,20 @@ export async function listVersions(req, res) {
      WHERE template_id = $1 ORDER BY created_at ASC`,
     [req.params.id],
   );
+  // Resolve each version's source label from the same result set (no JOIN).
+  const versionLabelById = new Map(rows.map((r) => [r.id, r.label]));
+  const versions = rows.map((r) => ({
+    ...r,
+    source_label: r.forked_from_version_id
+      ? versionLabelById.get(r.forked_from_version_id) || null
+      : null,
+  }));
   const [tpl] = await sql.unsafe(
     `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1`,
     [req.params.id],
   );
   res.json({
-    versions: rows,
+    versions,
     published_version_id: tpl?.published_version_id || null,
   });
 }
