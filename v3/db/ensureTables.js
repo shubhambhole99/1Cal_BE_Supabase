@@ -459,6 +459,9 @@ export async function ensureTables() {
       `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS group_id VARCHAR(24)`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS input_sections JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS page_groups JSONB DEFAULT '[]'::jsonb`,
+      // Report branding — { letterhead: <dataURL>, watermark: <dataURL>,
+      // letterheadEnabled, watermarkEnabled, watermarkPages: "all"|[pageId], ... }.
+      `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS branding JSONB DEFAULT '{}'::jsonb`,
       // Page groups are now VERSION-scoped content (like pages / master inputs /
       // MI groups). Each version owns its own set. The legacy template-level
       // `v3_templates.page_groups` column above is kept as the pre-migration

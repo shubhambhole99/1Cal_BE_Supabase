@@ -73,6 +73,7 @@ function normalizeTemplate(t) {
   if (!t || typeof t !== "object") return t;
   const out = { ...t };
   if ("input_sections" in out) out.input_sections = parseJsonbStr(out.input_sections, []);
+  if ("branding" in out) out.branding = parseJsonbStr(out.branding, {});
   return out;
 }
 
@@ -292,6 +293,12 @@ export async function patchTemplate(req, res) {
   const sql = getSql();
   const b = req.body || {};
 
+  // Ensure the branding column exists before writing it (idempotent — covers a
+  // DB where ensureTables hasn't yet run the migration).
+  if (Object.prototype.hasOwnProperty.call(b, "branding")) {
+    await sql.unsafe(`ALTER TABLE ${T.v3_templates} ADD COLUMN IF NOT EXISTS branding JSONB DEFAULT '{}'::jsonb`).catch(() => {});
+  }
+
   // ── page_groups is VERSION-scoped content now ──────────────────────────────
   // It no longer lives on v3_templates. Route it to the active version's row
   // (resolved from ?version= / body.version_id, else the published version) and
@@ -319,6 +326,7 @@ export async function patchTemplate(req, res) {
     ["scheme", "scheme"],
     ["description", "description"],
     ["input_sections", "input_sections"],
+    ["branding", "branding"],
     ["disabled", "disabled"],
     ["ord", "ord"],
     // Persisted pointer to the version the editor currently has open (the
@@ -331,8 +339,15 @@ export async function patchTemplate(req, res) {
   let i = 2;
   for (const [col, key] of fields) {
     if (Object.prototype.hasOwnProperty.call(b, key)) {
-      sets.push(`"${col}" = $${i}`);
-      params.push(b[key]);
+      // branding is JSONB — write it as an explicit JSON string + ::jsonb cast
+      // so the driver never coerces the object into a Postgres array literal.
+      if (col === "branding") {
+        sets.push(`"${col}" = $${i}::jsonb`);
+        params.push(JSON.stringify(b[key] ?? {}));
+      } else {
+        sets.push(`"${col}" = $${i}`);
+        params.push(b[key]);
+      }
       i++;
     }
   }
@@ -2679,6 +2694,7 @@ export async function getInstance(req, res) {
       scheme: tpl.scheme,
       description: tpl.description,
       input_sections: parseJsonbStr(tpl.input_sections, []),
+      branding: parseJsonbStr(tpl.branding, {}),
       published_version_id: tpl.published_version_id,
     } : null,
     pages: pages.map(normalizePage),
