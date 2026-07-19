@@ -3104,9 +3104,82 @@ export async function saveDcprRules(req, res) {
   }
 }
 
-// GET /v3/dcpr/schemes?land_title=&locality=&plot_area= — evaluate the rules.
-// A rule matches when land_title equals, locality matches (or the rule's
-// locality is null = any), and the plot area is in [min, max) — nulls unbounded.
+// Walk the saved DCPR decision GRAPH (mumbai_dcpr_workflow_graph) and collect the
+// calculation ids of every scheme leaf whose path matches the given land title +
+// location + plot area. This is the SAME graph the public scheme selector walks,
+// so /report/new and /dcprschemes always agree — and both follow whatever the
+// admin builder (/admin/report-workflow) saves. Questions the report workflow
+// doesn't answer (e.g. Society's building status) are left OPEN: every matching
+// branch is unioned, which is exactly the set the workflow presents (grouped) for
+// the user to pick.
+function graphSchemeCalcIds(graph, { landTitle, locality, plot }) {
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph?.edges) ? graph.edges : [];
+  if (!nodes.length) return [];
+  const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
+  const out = {};
+  edges.forEach((e) => { (out[e.source] = out[e.source] || []).push(e); });
+  const hasIn = new Set(edges.map((e) => e.target));
+  const root = nodes.find((n) => !hasIn.has(n.id)) || nodes[0];
+  const ids = [];
+  const addCalcs = (n) => {
+    for (const c of Array.isArray(n?.data?.calcs) ? n.data.calcs : []) {
+      if (c && c.id && !ids.includes(c.id)) ids.push(c.id);
+    }
+  };
+  // Whether an answer node is compatible with the caller's inputs. An answer only
+  // prunes the walk when we KNOW the relevant input; unknown inputs pass through.
+  const answerMatches = (ans, questionLabel) => {
+    const d = ans?.data || {};
+    const label = String(questionLabel || "").toLowerCase();
+    // Numeric plot-area band — the answer carries condition { op, value }.
+    if (d.condition && typeof d.condition.value === "number") {
+      if (plot == null) return true;
+      const v = plot, t = d.condition.value;
+      switch (d.condition.op) {
+        case ">=": return v >= t;
+        case ">":  return v > t;
+        case "<=": return v <= t;
+        case "<":  return v < t;
+        case "==": return v === t;
+        default:   return true;
+      }
+    }
+    // Land-title question — match by the answer's value (MHADA/SOCIETY/...).
+    if (label.includes("land")) {
+      if (!landTitle) return true;
+      return String(d.value || "").toUpperCase() === landTitle.toUpperCase();
+    }
+    // Location question (City / Suburb) — match by value (CITY/SUBURB).
+    if (label.includes("location") || label.includes("city") || label.includes("suburb")) {
+      if (!locality) return true;
+      return String(d.value || "").toUpperCase() === String(locality).toUpperCase();
+    }
+    // Any other question (e.g. building status) is not asked by the report
+    // workflow → leave open so every branch's schemes are unioned.
+    return true;
+  };
+  const walk = (id) => {
+    const n = byId[id];
+    if (!n) return;
+    if (n.type === "scheme") { addCalcs(n); return; }
+    for (const e of out[id] || []) {
+      const child = byId[e.target];
+      if (n.type === "question" && child?.type === "answer") {
+        if (!answerMatches(child, n.data?.label || n.data?.question)) continue;
+      }
+      walk(e.target);
+    }
+  };
+  walk(root.id);
+  return ids;
+}
+
+// GET /v3/dcpr/schemes?land_title=&locality=&plot_area= — the applicable schemes.
+// Derived from the saved decision GRAPH (single source of truth, identical to the
+// public scheme selector and edited in /admin/report-workflow), NOT the legacy
+// flat rules table — so the report workflow's terminal schemes always match
+// /dcprschemes and both update when the admin edits the graph.
 export async function evaluateDcprSchemes(req, res) {
   const sql = getSql();
   const landTitle = String(req.query?.land_title || "").trim();
@@ -3115,21 +3188,11 @@ export async function evaluateDcprSchemes(req, res) {
   const plot = rawPlot == null || rawPlot === "" || isNaN(Number(rawPlot)) ? null : Number(rawPlot);
   if (!landTitle) return res.json({ schemes: [] });
   try {
-    const rules = await sql.unsafe(
-      `SELECT scheme_calculation_ids FROM ${T.dcpr_rules}
-       WHERE land_title = $1
-         AND (locality IS NULL OR locality = $2)
-         AND (min_plot_area IS NULL OR ($3::numeric IS NOT NULL AND $3::numeric >= min_plot_area))
-         AND (max_plot_area IS NULL OR ($3::numeric IS NOT NULL AND $3::numeric < max_plot_area))
-       ORDER BY ord ASC`,
-      [landTitle, locality, plot],
+    const [row] = await sql.unsafe(
+      `SELECT payload FROM ${T.dcpr_graph} WHERE id = 'current' LIMIT 1`,
     );
-    const ids = [];
-    for (const r of Array.from(rules)) {
-      for (const cid of parseJsonbStr(r.scheme_calculation_ids, [])) {
-        if (!ids.includes(cid)) ids.push(cid);
-      }
-    }
+    const graph = row ? parseJsonbStr(row.payload, { nodes: [], edges: [] }) : { nodes: [], edges: [] };
+    const ids = graphSchemeCalcIds(graph, { landTitle, locality, plot });
     if (!ids.length) return res.json({ schemes: [] });
     const calcs = await sql.unsafe(
       `SELECT id, name, retemplate_id, prefill_master_inputs, hide_v3, disabled
