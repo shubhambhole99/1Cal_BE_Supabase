@@ -78,6 +78,7 @@ router.put("/dcpr/rules", ctrl.saveDcprRules);
 router.get("/dcpr/graph", ctrl.getDcprGraph);
 router.put("/dcpr/graph", ctrl.saveDcprGraph);
 router.get("/dcpr/schemes", ctrl.evaluateDcprSchemes);
+router.get("/dcpr/calculations", ctrl.resolveDcprCalculations);
 router.get("/dcpr/runs", ctrl.listDcprRuns);
 // Literal segment before :id so it isn't captured as an id.
 router.get("/dcpr/runs/by-instance/:instanceId", ctrl.getDcprRunByInstance);

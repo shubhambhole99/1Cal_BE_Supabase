@@ -3217,6 +3217,38 @@ export async function evaluateDcprSchemes(req, res) {
   }
 }
 
+// GET /v3/dcpr/calculations?ids=a,b,c — resolve calculation ids to openable
+// scheme objects. Used by /report/new after it walks the decision graph to a
+// scheme node (whose data.calcs carry only { id, name }) so it can open the
+// report for a chosen scheme.
+export async function resolveDcprCalculations(req, res) {
+  const sql = getSql();
+  const ids = String(req.query?.ids || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!ids.length) return res.json({ schemes: [] });
+  try {
+    const calcs = await sql.unsafe(
+      `SELECT id, name, retemplate_id, prefill_master_inputs, hide_v3, disabled
+       FROM ${T.v3_calculations} WHERE id = ANY($1)`,
+      [ids],
+    );
+    const byId = new Map(Array.from(calcs).map((c) => [c.id, c]));
+    const schemes = ids
+      .map((cid) => byId.get(cid))
+      .filter(Boolean)
+      .map((c) => ({
+        calculation_id: c.id,
+        name: c.name,
+        retemplate_id: c.retemplate_id,
+        prefill_master_inputs: c.prefill_master_inputs,
+        hide_v3: c.hide_v3,
+        disabled: c.disabled,
+      }));
+    res.json({ schemes });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
 // POST /v3/dcpr/runs — record a workflow run. Called the moment a user starts
 // a new report (status defaults to 'started'); the row is then PATCHed as they
 // progress and again when the V3 report (instance) is opened.
