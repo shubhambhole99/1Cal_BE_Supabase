@@ -79,6 +79,12 @@ router.get("/dcpr/graph", ctrl.getDcprGraph);
 router.put("/dcpr/graph", ctrl.saveDcprGraph);
 router.get("/dcpr/schemes", ctrl.evaluateDcprSchemes);
 router.get("/dcpr/calculations", ctrl.resolveDcprCalculations);
+// Post-instance workflow config (common + per-calculation steps), per retemplate.
+router.get("/post-instance-workflow/:retemplateId", ctrl.getPostInstanceWorkflow);
+router.put("/post-instance-workflow/:retemplateId", ctrl.savePostInstanceWorkflow);
+// Post-instance FAQ config (common + per-calculation FAQs), per retemplate.
+router.get("/post-instance-faq/:retemplateId", ctrl.getPostInstanceFaq);
+router.put("/post-instance-faq/:retemplateId", ctrl.savePostInstanceFaq);
 router.get("/dcpr/runs", ctrl.listDcprRuns);
 // Literal segment before :id so it isn't captured as an id.
 router.get("/dcpr/runs/by-instance/:instanceId", ctrl.getDcprRunByInstance);

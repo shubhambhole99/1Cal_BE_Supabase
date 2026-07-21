@@ -25,6 +25,8 @@ const T = {
   projects: `"${SCHEMA}"."projects"`,
   active_context: `"${SCHEMA}"."active_context"`,
   legacy_templates: `"${SCHEMA}"."templates"`,
+  piw: `"${SCHEMA}"."v3_post_instance_workflow"`,
+  piw_faq: `"${SCHEMA}"."v3_post_instance_faq"`,
 };
 
 // ── JSONB read normalization ──────────────────────────────────────────────────
@@ -519,17 +521,16 @@ export async function reorderMasterInputs(req, res) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
   try {
-    await sql.begin(async (tx) => {
-      for (let i = 0; i < ids.length; i++) {
-        await tx.unsafe(
-          `UPDATE ${T.master_input}
-             SET ord = $1
-           WHERE id = $2 AND template_id = $3
-             AND ($4::text IS NULL OR version_id = $4)`,
-          [i, ids[i], template_id, vId],
-        );
-      }
-    });
+    // Single bulk UPDATE — one statement instead of one-per-id, so templates
+    // with thousands of master inputs don't hit the statement timeout.
+    await sql.unsafe(
+      `UPDATE ${T.master_input} AS m
+          SET ord = t.ord - 1
+         FROM unnest($1::text[]) WITH ORDINALITY AS t(id, ord)
+        WHERE m.id = t.id AND m.template_id = $2
+          AND ($3::text IS NULL OR m.version_id = $3)`,
+      [ids, template_id, vId],
+    );
   } catch (e) {
     return res.status(500).json({ error: `reorder failed: ${e.message}` });
   }
@@ -1201,17 +1202,14 @@ export async function reorderMasterInputGroups(req, res) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
   try {
-    await sql.begin(async (tx) => {
-      for (let i = 0; i < ids.length; i++) {
-        await tx.unsafe(
-          `UPDATE ${T.master_input_group}
-             SET ord = $1
-           WHERE id = $2 AND template_id = $3
-             AND ($4::text IS NULL OR version_id = $4)`,
-          [i, ids[i], template_id, vId],
-        );
-      }
-    });
+    await sql.unsafe(
+      `UPDATE ${T.master_input_group} AS m
+          SET ord = t.ord - 1
+         FROM unnest($1::text[]) WITH ORDINALITY AS t(id, ord)
+        WHERE m.id = t.id AND m.template_id = $2
+          AND ($3::text IS NULL OR m.version_id = $3)`,
+      [ids, template_id, vId],
+    );
   } catch (e) {
     return res.status(500).json({ error: `reorder failed: ${e.message}` });
   }
@@ -2460,12 +2458,33 @@ export async function listInstances(req, res) {
       [templateId],
     );
   } else {
+    // My Files list path. Two performance levers over the old `SELECT i.*` on
+    // ALL instances:
+    //   1) Server-side user filter — return only the caller's own + shared
+    //      instances instead of shipping every row to the browser to filter.
+    //   2) Trimmed projection — the list only needs identity + template labels,
+    //      so we skip the heavy `print_overrides` JSONB (only the instance
+    //      editor reads it). This is the bulk of the payload weight.
+    // Matching is done as text so it works whether ids/collaborators are stored
+    // as strings or numbers; the collaborators array is expanded defensively.
+    const userId = req.query.user_id ? String(req.query.user_id) : null;
     rows = await sql.unsafe(
-      `SELECT i.*, t.name AS template_name, t.scheme AS template_scheme
+      `SELECT i.id, i.template_id, i.version_id, i.name, i.user_id, i.collaborators,
+              i.calculation_id, i.created_at, i.updated_at,
+              t.name AS template_name, t.scheme AS template_scheme
        FROM ${T.v3_instances} i
        LEFT JOIN ${T.v3_templates} t ON t.id = i.template_id
+       WHERE $1::text IS NULL
+          OR i.user_id::text = $1::text
+          OR EXISTS (
+               SELECT 1 FROM jsonb_array_elements_text(
+                 CASE WHEN jsonb_typeof(i.collaborators) = 'array'
+                      THEN i.collaborators ELSE '[]'::jsonb END
+               ) AS collab(uid) WHERE collab.uid = $1::text
+             )
        ORDER BY i.created_at DESC
        LIMIT 500`,
+      [userId],
     );
   }
   res.json({ instances: rows.map(normalizeInstance) });
@@ -2954,6 +2973,111 @@ export async function patchInstanceMasterInput(req, res) {
     [instanceId, templateMiId],
   );
   res.json(normalizeMasterInput(row));
+}
+
+// ── Post-Instance Workflow config (admin: /admin/post-instance-workflow) ──────
+// Per-retemplate JSONB: { common: [...steps]|null, perCalc: { <calcName>: [...steps] } }.
+// The instance viewer's Workflow drawer renders common + the calc-specific steps.
+async function ensurePiwTable(sql) {
+  await sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.piw} (retemplate_id VARCHAR(24) PRIMARY KEY, payload JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ DEFAULT NOW())`)
+    .catch(() => {});
+}
+
+// GET /v3/post-instance-workflow/:retemplateId
+export async function getPostInstanceWorkflow(req, res) {
+  const sql = getSql();
+  try {
+    await ensurePiwTable(sql);
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw} WHERE retemplate_id = $1 LIMIT 1`, [req.params.retemplateId]);
+    const p = row ? parseJsonbStr(row.payload, {}) : {};
+    res.json({
+      common: Array.isArray(p.common) ? p.common : null,
+      perCalc: p.perCalc && typeof p.perCalc === "object" && !Array.isArray(p.perCalc) ? p.perCalc : {},
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/post-instance-workflow/:retemplateId — body { common?, perCalc? }.
+// Merges with the stored config so a common-only or calc-only save keeps the rest.
+export async function savePostInstanceWorkflow(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    await ensurePiwTable(sql);
+    const rid = req.params.retemplateId;
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
+    const cur = row ? parseJsonbStr(row.payload, {}) : {};
+    const next = {
+      common: Array.isArray(b.common) ? b.common : (Array.isArray(cur.common) ? cur.common : null),
+      perCalc: {
+        ...(cur.perCalc && typeof cur.perCalc === "object" ? cur.perCalc : {}),
+        ...(b.perCalc && typeof b.perCalc === "object" ? b.perCalc : {}),
+      },
+    };
+    await sql.unsafe(
+      `INSERT INTO ${T.piw} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+      [rid, JSON.stringify(next)],
+    );
+    res.json({ ok: true, ...next });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// ── Post-Instance FAQ config (admin: /admin/post-instance-faq) ────────────────
+// Per-retemplate JSONB: { common: [...faqs]|null, perCalc: { <calcName>: [...faqs] } }.
+// A faq = { id, question, answer, fields: [optional attached master inputs] }.
+async function ensurePiwFaqTable(sql) {
+  await sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.piw_faq} (retemplate_id VARCHAR(24) PRIMARY KEY, payload JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ DEFAULT NOW())`)
+    .catch(() => {});
+}
+
+// GET /v3/post-instance-faq/:retemplateId
+export async function getPostInstanceFaq(req, res) {
+  const sql = getSql();
+  try {
+    await ensurePiwFaqTable(sql);
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw_faq} WHERE retemplate_id = $1 LIMIT 1`, [req.params.retemplateId]);
+    const p = row ? parseJsonbStr(row.payload, {}) : {};
+    res.json({
+      common: Array.isArray(p.common) ? p.common : null,
+      perCalc: p.perCalc && typeof p.perCalc === "object" && !Array.isArray(p.perCalc) ? p.perCalc : {},
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/post-instance-faq/:retemplateId — body { common?, perCalc? } (merges).
+export async function savePostInstanceFaq(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    await ensurePiwFaqTable(sql);
+    const rid = req.params.retemplateId;
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw_faq} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
+    const cur = row ? parseJsonbStr(row.payload, {}) : {};
+    const next = {
+      common: Array.isArray(b.common) ? b.common : (Array.isArray(cur.common) ? cur.common : null),
+      perCalc: {
+        ...(cur.perCalc && typeof cur.perCalc === "object" ? cur.perCalc : {}),
+        ...(b.perCalc && typeof b.perCalc === "object" ? b.perCalc : {}),
+      },
+    };
+    await sql.unsafe(
+      `INSERT INTO ${T.piw_faq} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+      [rid, JSON.stringify(next)],
+    );
+    res.json({ ok: true, ...next });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 }
 
 // ── GET /v3/active-context ────────────────────────────────────────────────────

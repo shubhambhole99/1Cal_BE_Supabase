@@ -131,6 +131,27 @@ const directWithTemplateSelect = {
 };
 
 /**
+ * LIGHT projection for list endpoints (getMyFeasibilities, getCollaborativeFeasibilities).
+ * Deliberately OMITS the heavy per-feasibility blobs — pages, masterinput,
+ * inputsections, newPages, newMasterinput, newInputsections, fixedparameterset —
+ * which together make a single row ~190 KB. The My Files list only needs identity
+ * + labels; the full document is re-fetched by id when a file is opened. This cuts
+ * the getmy/getcollab payload from ~1.9 MB / 10 rows to a few KB.
+ */
+const directListSelect = {
+  id: directFeasibilities.id,
+  templateId: directFeasibilities.templateId,
+  name: directFeasibilities.name,
+  createdAt: directFeasibilities.createdAt,
+  lastModifiedAt: directFeasibilities.lastModifiedAt,
+  userid: directFeasibilities.userid,
+  collaborators: directFeasibilities.collaborators,
+  isDisabled: directFeasibilities.isDisabled,
+  templateName: templates.name,
+  templateScheme: templates.scheme,
+};
+
+/**
  * Maps a joined row (direct + template) to the old API shape: _id, populated templateId,
  * CreatedAt, LastModifiedAt, and legacy new_pages, new_masterinput, new_inputsections.
  */
@@ -693,17 +714,21 @@ export async function getMyFeasibilities(req, res) {
     if (searchQuery) conditions.push(ilike(directFeasibilities.name, `%${searchQuery}%`));
     const filter = and(...conditions);
 
-    const [countResult] = await db.select({ count: sql`count(*)::int` }).from(directFeasibilities).where(filter);
+    // Run the count and the page query concurrently — they're independent and
+    // each is a full round-trip to the (remote) DB, so serial awaits doubled the
+    // latency for no reason.
+    const [[countResult], list] = await Promise.all([
+      db.select({ count: sql`count(*)::int` }).from(directFeasibilities).where(filter),
+      db
+        .select(directListSelect)
+        .from(directFeasibilities)
+        .leftJoin(templates, eq(directFeasibilities.templateId, templates.id))
+        .where(filter)
+        .orderBy(desc(directFeasibilities.createdAt))
+        .limit(limit)
+        .offset((page - 1) * limit),
+    ]);
     const totalTemplates = Number(countResult?.count ?? 0);
-
-    const list = await db
-      .select(directWithTemplateSelect)
-      .from(directFeasibilities)
-      .leftJoin(templates, eq(directFeasibilities.templateId, templates.id))
-      .where(filter)
-      .orderBy(desc(directFeasibilities.createdAt))
-      .limit(limit)
-      .offset((page - 1) * limit);
 
     return res.status(200).json({
       data: list.map(toDirectResponseWithTemplate),
@@ -734,17 +759,19 @@ export async function getCollaborativeFeasibilities(req, res) {
     if (searchQuery) conditions.push(ilike(directFeasibilities.name, `%${searchQuery}%`));
     const fullFilter = and(...conditions);
 
-    const [countResult] = await db.select({ count: sql`count(*)::int` }).from(directFeasibilities).where(fullFilter);
+    // Count + page query in parallel (independent round-trips).
+    const [[countResult], list] = await Promise.all([
+      db.select({ count: sql`count(*)::int` }).from(directFeasibilities).where(fullFilter),
+      db
+        .select(directListSelect)
+        .from(directFeasibilities)
+        .leftJoin(templates, eq(directFeasibilities.templateId, templates.id))
+        .where(fullFilter)
+        .orderBy(desc(directFeasibilities.createdAt))
+        .limit(limit)
+        .offset((page - 1) * limit),
+    ]);
     const totalTemplates = Number(countResult?.count ?? 0);
-
-    const list = await db
-      .select(directWithTemplateSelect)
-      .from(directFeasibilities)
-      .leftJoin(templates, eq(directFeasibilities.templateId, templates.id))
-      .where(fullFilter)
-      .orderBy(desc(directFeasibilities.createdAt))
-      .limit(limit)
-      .offset((page - 1) * limit);
 
     return res.status(200).json({
       data: list.map(toDirectResponseWithTemplate),
