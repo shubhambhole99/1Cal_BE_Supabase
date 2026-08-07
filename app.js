@@ -17,6 +17,7 @@ import contactRoutes from "./routes/contactRoutes.js";
 import billRoutes from "./routes/billRoutes.js";
 import aboutUsRoutes from "./routes/aboutUsRoutes.js";
 import commentRoutes from "./routes/commentRoutes.js";
+import gdriveRoutes from "./routes/gdriveRoutes.js";
 
 // v3 module (merged from BE 2 — self-contained under ./v3/*)
 import v3Routes from "./v3/routes/v3Routes.js";
@@ -41,6 +42,11 @@ const app = express();
 // of cells/styles) — compressing them shrinks the wire transfer ~10x, which is
 // the dominant cost for clients on a real network. threshold:1KB skips tiny bodies.
 app.use(compression({ threshold: 1024 }));
+
+// Cashfree webhook signatures are computed over the RAW request body, so capture
+// it as a Buffer for that one path BEFORE the global JSON parser consumes the
+// stream. Every other route falls through to express.json below unchanged.
+app.use("/v3/payments/webhook", express.raw({ type: "*/*", limit: "1mb" }));
 
 // Body parsing with high limit for large template payloads (match BE).
 // Note: On Vercel, request body is limited to 4.5MB; larger payloads need direct upload to storage.
@@ -93,6 +99,7 @@ app.use("/contact", contactRoutes);
 app.use("/bill", billRoutes);
 app.use("/aboutus", aboutUsRoutes);
 app.use("/comments", commentRoutes);
+app.use("/gdrive", gdriveRoutes);
 app.use("/v3", v3Routes);
 
 // Error handling

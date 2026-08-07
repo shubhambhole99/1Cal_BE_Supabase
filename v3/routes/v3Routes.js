@@ -1,5 +1,6 @@
 import express from "express";
 import * as ctrl from "../controller/v3Controller.js";
+import * as payments from "../controller/paymentsController.js";
 import { addClient } from "../lib/events.js";
 
 const router = express.Router();
@@ -27,13 +28,18 @@ router.post("/templates/:id/push-to-published", ctrl.pushToPublished);
 
 router.post("/pages", ctrl.createPage);
 router.post("/pages/reorder", ctrl.reorderPages);
+// Import a page from ANOTHER template as a read-only live mirror. Literal
+// segment declared before /pages/:id so it isn't captured as an id.
+router.post("/pages/import", ctrl.importPage);
 router.get("/pages/:id", ctrl.getPage);
 router.patch("/pages/:id", ctrl.patchPage);
 router.delete("/pages/:id", ctrl.deletePage);
+router.post("/pages/:id/duplicate", ctrl.duplicatePage);
 
 router.get("/master-inputs/:id", ctrl.getMasterInput);
 router.post("/master-inputs", ctrl.createMasterInput);
 router.post("/master-inputs/bulk", ctrl.bulkCreateMasterInputs);
+router.post("/master-inputs/import", ctrl.importMasterInputs);
 router.post("/master-inputs/wipe", ctrl.wipeVersionMasterInputs);
 router.post("/master-inputs/reorder", ctrl.reorderMasterInputs);
 router.patch("/master-inputs/:id", ctrl.patchMasterInput);
@@ -54,8 +60,30 @@ router.get("/instances/:id", ctrl.getInstance);
 router.patch("/instances/:id", ctrl.patchInstance);
 router.delete("/instances/:id", ctrl.deleteInstance);
 router.post("/instances/:id/copy", ctrl.copyInstance);
+// Instance links — live 2-way mimic between two reports.
+router.get("/instance-links", ctrl.listInstanceLinks);
+router.post("/instance-links", ctrl.createInstanceLink);
+router.patch("/instance-links/:id", ctrl.patchInstanceLink);
+router.delete("/instance-links/:id", ctrl.deleteInstanceLink);
 router.get("/instances/:id/master-inputs", ctrl.getInstanceMasterInputs);
+// Bulk seed/replace overrides — literal /bulk before /:templateMiId so it isn't
+// captured as a template-mi id.
+router.post("/instances/:instanceId/master-inputs/bulk", ctrl.bulkPatchInstanceMasterInputs);
 router.patch("/instances/:instanceId/master-inputs/:templateMiId", ctrl.patchInstanceMasterInput);
+
+// Per-instance comments (flat discussion thread). Delete is keyed by comment id.
+router.get("/instances/:id/comments", ctrl.listInstanceComments);
+router.post("/instances/:id/comments", ctrl.createInstanceComment);
+router.delete("/comments/:commentId", ctrl.deleteInstanceComment);
+
+// Combined comparison reports (multi-instance). Literal /preview before /:id so
+// it isn't captured as a report id.
+router.get("/reports/preview", ctrl.previewReport);
+router.get("/reports", ctrl.listReports);
+router.post("/reports", ctrl.createReport);
+router.get("/reports/:id", ctrl.getReport);
+router.patch("/reports/:id", ctrl.patchReport);
+router.delete("/reports/:id", ctrl.deleteReport);
 
 router.get("/legacy/templates", ctrl.listLegacyTemplates);
 router.post("/migrate/:legacyTemplateId", ctrl.migrateLegacy);
@@ -85,11 +113,30 @@ router.put("/post-instance-workflow/:retemplateId", ctrl.savePostInstanceWorkflo
 // Post-instance FAQ config (common + per-calculation FAQs), per retemplate.
 router.get("/post-instance-faq/:retemplateId", ctrl.getPostInstanceFaq);
 router.put("/post-instance-faq/:retemplateId", ctrl.savePostInstanceFaq);
+// Test sets — named MI-override snapshots for the retemplate editor Testing tab.
+router.get("/test-sets/:templateId", ctrl.getTestSets);
+router.put("/test-sets/:templateId", ctrl.saveTestSets);
+// Report dashboard config (version-scoped widgets linked to cells), per retemplate.
+router.get("/dashboard/:retemplateId", ctrl.getDashboard);
+router.put("/dashboard/:retemplateId", ctrl.saveDashboard);
+// Sources — standalone reusable reference docs (markdown + attached Drive files).
+router.get("/sources", ctrl.listSources);
+router.post("/sources", ctrl.createSource);
+router.get("/sources/:id", ctrl.getSource);
+router.put("/sources/:id", ctrl.updateSource);
+router.delete("/sources/:id", ctrl.deleteSource);
 router.get("/dcpr/runs", ctrl.listDcprRuns);
 // Literal segment before :id so it isn't captured as an id.
 router.get("/dcpr/runs/by-instance/:instanceId", ctrl.getDcprRunByInstance);
 router.post("/dcpr/runs", ctrl.createDcprRun);
 router.patch("/dcpr/runs/:id", ctrl.updateDcprRun);
 // DELETE route intentionally removed — use PATCH { disabled: true } instead.
+
+// Cashfree payments — ledger + create/verify/webhook. Literal segments are
+// declared before any :param so they aren't captured as ids.
+router.get("/payments", payments.listPayments);
+router.post("/payments/create-order", payments.createPaymentOrder);
+router.get("/payments/status/:orderId", payments.getPaymentStatus);
+router.post("/payments/webhook", payments.cashfreeWebhook);
 
 export default router;

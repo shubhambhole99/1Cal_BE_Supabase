@@ -156,6 +156,19 @@ export async function ensureTables() {
       PRIMARY KEY (version_id, page_id)
     )`);
 
+    // Imported-page links: a page in `template_id` that is a read-only live
+    // mirror of `source_page_name` in `source_template_id` (its published
+    // version). Keyed by (template_id, page_name) so the link survives version
+    // forks (which copy pages by name). See v3Controller importPage/getPage.
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_page_imports")} (
+      template_id        VARCHAR(24) NOT NULL,
+      page_name          TEXT NOT NULL,
+      source_template_id VARCHAR(24) NOT NULL,
+      source_page_name   TEXT NOT NULL,
+      created_at         TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (template_id, page_name)
+    )`);
+
     await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_master_input")} (
       id              VARCHAR(24) PRIMARY KEY,
       template_id     VARCHAR(24) NOT NULL,
@@ -264,6 +277,37 @@ export async function ensureTables() {
       UNIQUE (instance_id, template_mi_id)
     )`);
 
+    // ── Combined comparison reports (multi-instance) ──────────────────────────
+    // A "report" groups several standalone instances so they can be compared
+    // side-by-side. Instances stay fully standalone (own their own master-input
+    // overrides); the report is just an ordered set of members. This is the
+    // grouping layer that lets N instances roll up into one comparison view.
+    // (Option A from Current Architecture/scheme-report-architecture.html.)
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_reports")} (
+      id          VARCHAR(24) PRIMARY KEY,
+      name        TEXT,
+      user_id     VARCHAR(24),
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    // Link table: which instances belong to a report and in what column order.
+    // ON DELETE CASCADE so removing a report drops its links (never its instances).
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_report_instances")} (
+      id           VARCHAR(24) PRIMARY KEY,
+      report_id    VARCHAR(24) NOT NULL,
+      instance_id  VARCHAR(24) NOT NULL,
+      ord          INTEGER NOT NULL DEFAULT 0,
+      col_label    TEXT,
+      UNIQUE (report_id, instance_id)
+    )`);
+    await sql.unsafe(`ALTER TABLE ${ref("v3_report_instances")}
+      DROP CONSTRAINT IF EXISTS v3_report_instances_report_fk`).catch(() => {});
+    await sql.unsafe(`ALTER TABLE ${ref("v3_report_instances")}
+      ADD CONSTRAINT v3_report_instances_report_fk
+      FOREIGN KEY (report_id) REFERENCES ${ref("v3_reports")}(id) ON DELETE CASCADE`).catch(() => {});
+    await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_report_inst_report ON ${ref("v3_report_instances")}(report_id)`);
+    await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_report_inst_inst ON ${ref("v3_report_instances")}(instance_id)`);
+
     // Real Estate calculations — standalone entities surfaced by the
     // landing-L Real Estate section. Not tied to a template or a version;
     // they are just a flat list with name / description / sector / author.
@@ -314,6 +358,12 @@ export async function ensureTables() {
     await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS applicable_localities JSONB DEFAULT '[]'::jsonb`);
     await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS min_plot_area NUMERIC`);
     await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS max_plot_area NUMERIC`);
+    // Rich blog/content page for the public calculation detail page, authored in
+    // the admin blog editor as Markdown or HTML. `blog_format` ('md' | 'html')
+    // says how blog_content should be rendered; legacy rows (no format) are
+    // treated as HTML at read time via a CASE fallback.
+    await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS blog_content TEXT`);
+    await sql.unsafe(`ALTER TABLE ${ref("v3_calculations")} ADD COLUMN IF NOT EXISTS blog_format TEXT`);
 
     // `ord` + `disabled` on v3_templates power the admin Re-Template
     // listing's drag-to-reorder + disable-toggle UI (mirrors the
@@ -383,6 +433,30 @@ export async function ensureTables() {
       id         TEXT PRIMARY KEY,
       payload    JSONB NOT NULL DEFAULT '{}'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+
+    // Cashfree payments ledger. One row per payment attempt; `mode` ('test' |
+    // 'prod') is derived from CASHFREE_ENV so sandbox and live payments share
+    // one table and stay distinguishable in the admin Payments page.
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_payments")} (
+      id                  VARCHAR(24) PRIMARY KEY,
+      order_id            TEXT UNIQUE,
+      cf_order_id         TEXT,
+      payment_session_id  TEXT,
+      cf_payment_id       TEXT,
+      payment_method      TEXT,
+      user_id             VARCHAR(24),
+      username            TEXT,
+      customer_phone      TEXT,
+      customer_email      TEXT,
+      amount              NUMERIC,
+      currency            TEXT DEFAULT 'INR',
+      status              TEXT DEFAULT 'CREATED',
+      mode                TEXT DEFAULT 'test',
+      purpose             TEXT,
+      raw                 JSONB DEFAULT '{}'::jsonb,
+      created_at          TIMESTAMPTZ DEFAULT NOW(),
+      updated_at          TIMESTAMPTZ DEFAULT NOW()
     )`);
 
     // ── 2. Migrate existing schema if upgrading ─────────────────────────
@@ -457,6 +531,16 @@ export async function ensureTables() {
       `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'basic'`,
       `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS group_name TEXT`,
       `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS group_id VARCHAR(24)`,
+      // Provenance for master inputs copied in via POST /v3/master-inputs/import.
+      // is_imported flags the row for the "Imported" badge/filter in the MI panel;
+      // imported_from records the source template id (tooltip only). Unlike pages,
+      // imported MIs are a real editable COPY — this is provenance, not a live mirror.
+      `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS is_imported BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS imported_from VARCHAR(24)`,
+      // Same provenance on groups that an import auto-creates in the target — the
+      // MI panel renders these blue and locks them from editing.
+      `ALTER TABLE ${ref("v3_master_input_group")} ADD COLUMN IF NOT EXISTS is_imported BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE ${ref("v3_master_input_group")} ADD COLUMN IF NOT EXISTS imported_from VARCHAR(24)`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS input_sections JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS page_groups JSONB DEFAULT '[]'::jsonb`,
       // Report branding — { letterhead: <dataURL>, watermark: <dataURL>,

@@ -18,6 +18,7 @@ const T = {
   instance_mi: `"${SCHEMA}"."v3_instance_master_input"`,
   v3_versions: `"${SCHEMA}"."v3_versions"`,
   v3_vdiffs: `"${SCHEMA}"."v3_version_diffs"`,
+  v3_page_imports: `"${SCHEMA}"."v3_page_imports"`,
   v3_calculations: `"${SCHEMA}"."v3_calculations"`,
   dcpr_rules: `"${SCHEMA}"."mumbai_dcpr_workflow_rules"`,
   dcpr_runs: `"${SCHEMA}"."mumbai_dcpr_workflow_runs"`,
@@ -27,6 +28,13 @@ const T = {
   legacy_templates: `"${SCHEMA}"."templates"`,
   piw: `"${SCHEMA}"."v3_post_instance_workflow"`,
   piw_faq: `"${SCHEMA}"."v3_post_instance_faq"`,
+  test_sets: `"${SCHEMA}"."v3_test_sets"`,
+  dashboard: `"${SCHEMA}"."v3_dashboard"`,
+  sources: `"${SCHEMA}"."v3_sources"`,
+  reports: `"${SCHEMA}"."v3_reports"`,
+  report_instances: `"${SCHEMA}"."v3_report_instances"`,
+  comments: `"${SCHEMA}"."v3_comments"`,
+  instance_links: `"${SCHEMA}"."v3_instance_links"`,
 };
 
 // ── JSONB read normalization ──────────────────────────────────────────────────
@@ -105,9 +113,19 @@ async function resolveVersionId(sql, templateId, explicit) {
 // management handlers (createVersion / publish / restore / ensureDraft) are
 // intentionally NOT guarded — they legitimately operate across versions.
 const PUBLISHED_LOCK_MSG =
-  "The published version is locked. Edit the draft (it auto-promotes on Publish).";
+  "This version was published and is locked for versioning. Fork it into a new draft to make changes.";
+// A version is locked for edits if it is, or ever was, published (`was_published`).
+// Once-published releases are preserved immutably; to change one you fork it.
+// Falls back to the template's current published_version_id so rows that predate
+// the flag / a mid-request column add are still protected.
 async function isPublishedVersion(sql, templateId, versionId) {
   if (!templateId || !versionId) return false;
+  await ensureVerForkCol(sql);
+  const [v] = await sql.unsafe(
+    `SELECT was_published FROM ${T.v3_versions} WHERE id = $1 AND template_id = $2 LIMIT 1`,
+    [versionId, templateId],
+  );
+  if (v && v.was_published) return true;
   const [t] = await sql.unsafe(
     `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
     [templateId],
@@ -477,6 +495,179 @@ export async function bulkCreateMasterInputs(req, res) {
   res.status(201).json({ count: ids.length, ids });
 }
 
+// ── POST /v3/master-inputs/import ─────────────────────────────────────────────
+// Body: { template_id, version_id?, source_template_id, source_version_id?,
+//         keys?: [key], sections?: [section], on_conflict?: "skip"|"suffix" }
+// COPIES the selected master inputs (and the groups they belong to) from ANOTHER
+// template's version into the target draft. This is a one-time copy, NOT a live
+// mirror like imported pages: an MI's `ref` binds by page-name within THIS
+// template and drives its cells, so imported rows must be normal, editable,
+// re-bindable inputs. Groups are remapped/deduped by (section, key); MI key
+// collisions are skipped or suffixed per `on_conflict`.
+// Lazily add the master-input import-provenance columns (is_imported,
+// imported_from). ensureTables adds these too, but its v3 migration can bail
+// early on some DBs, so guarantee them here before an import writes them.
+// Memoized ALTER ... IF NOT EXISTS — a cheap catalog check after the first run.
+let _miImportColsEnsured = null;
+function ensureMiImportColumns() {
+  if (_miImportColsEnsured) return _miImportColsEnsured;
+  const sql = getSql();
+  _miImportColsEnsured = (async () => {
+    await sql.unsafe(`ALTER TABLE ${T.master_input} ADD COLUMN IF NOT EXISTS is_imported BOOLEAN DEFAULT FALSE`);
+    await sql.unsafe(`ALTER TABLE ${T.master_input} ADD COLUMN IF NOT EXISTS imported_from VARCHAR(24)`);
+    await sql.unsafe(`ALTER TABLE ${T.master_input_group} ADD COLUMN IF NOT EXISTS is_imported BOOLEAN DEFAULT FALSE`);
+    await sql.unsafe(`ALTER TABLE ${T.master_input_group} ADD COLUMN IF NOT EXISTS imported_from VARCHAR(24)`);
+  })().catch((e) => { _miImportColsEnsured = null; throw e; });
+  return _miImportColsEnsured;
+}
+
+export async function importMasterInputs(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  if (!b.template_id || !b.source_template_id) {
+    return res.status(400).json({ error: "template_id and source_template_id required" });
+  }
+  if (b.template_id === b.source_template_id) {
+    return res.status(400).json({ error: "Cannot import master inputs from the same template" });
+  }
+  const keys = Array.isArray(b.keys) ? b.keys.filter(Boolean) : [];
+  const sections = Array.isArray(b.sections) ? b.sections.filter(Boolean) : [];
+  if (keys.length === 0 && sections.length === 0) {
+    return res.status(400).json({ error: "Provide keys[] and/or sections[] to import" });
+  }
+  const onConflict = b.on_conflict === "suffix" ? "suffix" : "skip";
+  try {
+    await ensureMiImportColumns();
+    const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
+    if (!versionId) return res.status(400).json({ error: "Target template has no version yet" });
+    if (await isPublishedVersion(sql, b.template_id, versionId)) {
+      return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+    }
+    // Resolve the source version (defaults to the source's published version).
+    let srcV = b.source_version_id || null;
+    if (!srcV) {
+      const [srcT] = await sql.unsafe(
+        `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+        [b.source_template_id],
+      );
+      if (!srcT) return res.status(404).json({ error: "Source template not found" });
+      srcV = srcT.published_version_id || null;
+    }
+    // Read the source MIs + groups, then pick the selection.
+    const srcMIs = await sql.unsafe(
+      `SELECT * FROM ${T.master_input}
+        WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)
+        ORDER BY ord ASC`,
+      [b.source_template_id, srcV],
+    );
+    const srcGroups = await sql.unsafe(
+      `SELECT * FROM ${T.master_input_group}
+        WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
+      [b.source_template_id, srcV],
+    );
+    const keySet = new Set(keys);
+    const secSet = new Set(sections);
+    const selected = srcMIs.filter(
+      (m) => m.key && (keySet.has(m.key) || (m.section && secSet.has(m.section))),
+    );
+    if (selected.length === 0) {
+      return res.json({ imported_mis: 0, imported_groups: 0, skipped_keys: [], renamed: {}, version_id: versionId });
+    }
+    // 1) Remap the groups the selected MIs belong to (upsert dedupes by section::key).
+    const groupById = new Map(srcGroups.map((g) => [g.id, g]));
+    const neededGroupIds = [...new Set(selected.map((m) => m.group_id).filter(Boolean))];
+    const srcGroupToNew = new Map();
+    let importedGroups = 0;
+    if (neededGroupIds.length) {
+      await sql.begin(async (tx) => {
+        for (const gid of neededGroupIds) {
+          const g = groupById.get(gid);
+          if (!g) continue;
+          const newId = newObjectId();
+          // Flag ONLY groups this import actually creates as imported (blue +
+          // locked in the panel). A pre-existing group that matches on
+          // (section,key) hits DO UPDATE, which never touches is_imported, so the
+          // user's own group keeps its normal (editable) styling.
+          const rows = await tx.unsafe(
+            `INSERT INTO ${T.master_input_group}
+               (id, template_id, version_id, key, display_name, section, ord, is_imported, imported_from)
+             VALUES ($1,$2,$3,$4,$5,$6,$7, true, $8)
+             ON CONFLICT (template_id, version_id, section, key) DO UPDATE
+               SET display_name = EXCLUDED.display_name
+             RETURNING id`,
+            [newId, b.template_id, versionId, g.key, g.display_name ?? null, g.section ?? null, Number.isFinite(g.ord) ? g.ord : 0, b.source_template_id],
+          );
+          srcGroupToNew.set(gid, rows[0]?.id || newId);
+          importedGroups++;
+        }
+      });
+    }
+    // 2) Dedupe MI key collisions against the target version's existing keys.
+    const existing = await sql.unsafe(
+      `SELECT key FROM ${T.master_input} WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
+      [b.template_id, versionId],
+    );
+    const taken = new Set(existing.map((r) => r.key));
+    const skippedKeys = [];
+    const renamed = {};
+    const COLS = 16;
+    const insRows = [];
+    for (const m of selected) {
+      let key = m.key;
+      if (taken.has(key)) {
+        if (onConflict === "skip") { skippedKeys.push(m.key); continue; }
+        let n = 2;
+        while (taken.has(`${m.key}_${n}`)) n++;
+        key = `${m.key}_${n}`;
+        renamed[m.key] = key;
+      }
+      taken.add(key);
+      insRows.push([
+        newObjectId(), b.template_id, versionId, key, m.display_name ?? null,
+        m.value == null ? null : String(m.value), m.ref ?? null, m.type ?? "text", m.options ?? [],
+        m.section ?? null, m.kind ?? "basic", m.group_id ? (srcGroupToNew.get(m.group_id) ?? null) : null,
+        Number.isFinite(m.ord) ? m.ord : 0,
+        m.default_value == null ? (m.type === "multiselect" ? null : (m.value == null ? null : String(m.value))) : String(m.default_value),
+        // Provenance — flag as imported + record the source template (tooltip).
+        true, b.source_template_id,
+      ]);
+    }
+    // 3) Bulk insert the surviving MIs (same batched INSERT as bulkCreateMasterInputs).
+    const BATCH = 1000;
+    for (let off = 0; off < insRows.length; off += BATCH) {
+      const slice = insRows.slice(off, off + BATCH);
+      const tuples = slice
+        .map((_, r) => `(${Array.from({ length: COLS }, (_, c) => `$${r * COLS + c + 1}`).join(",")})`)
+        .join(",");
+      await sql.unsafe(
+        `INSERT INTO ${T.master_input}
+           (id, template_id, version_id, key, display_name, value, ref, type, options,
+            section, kind, group_id, ord, default_value, is_imported, imported_from)
+         VALUES ${tuples}`,
+        slice.flat(),
+      );
+    }
+    broadcast({
+      type: "masterInput.updated",
+      templateId: b.template_id,
+      versionId,
+      reason: "mis.imported",
+      count: insRows.length,
+      clientId: req.get("x-client-id") || null,
+    });
+    res.status(201).json({
+      imported_mis: insRows.length,
+      imported_groups: importedGroups,
+      skipped_keys: skippedKeys,
+      renamed,
+      version_id: versionId,
+    });
+  } catch (e) {
+    console.error("[importMasterInputs] error:", e?.message || e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+}
+
 // ── POST /v3/master-inputs/wipe ───────────────────────────────────────────────
 // Body: { template_id, version_id? } — delete every master-input in that
 // (template, version) in ONE statement. Restore/import calls this before a fresh
@@ -568,9 +759,29 @@ export async function getTemplate(req, res) {
     [id, versionId],
   );
 
+  // Imported-page links (read-only mirrors of pages in other templates). Keyed
+  // by page name so they apply across every version of this template. Attach the
+  // source descriptor (incl. source template name) to each matching page so the
+  // editor can flag it blue + show a "Imported from …" read-only banner.
+  let importLinkByName = new Map();
+  try {
+    await ensureImportTable(sql);
+    const links = await sql.unsafe(
+      `SELECT pi.page_name, pi.source_template_id, pi.source_page_name,
+              st.name AS source_template_name
+       FROM ${T.v3_page_imports} pi
+       LEFT JOIN ${T.v3_templates} st ON st.id = pi.source_template_id
+       WHERE pi.template_id = $1`,
+      [id],
+    );
+    importLinkByName = new Map(links.map((l) => [l.page_name, l]));
+  } catch (e) {
+    console.error("[getTemplate] import-link load error:", e?.message || e);
+  }
+
   await ensureVerForkCol(sql);
   const versionRows = await sql.unsafe(
-    `SELECT id, label, notes, author_id, created_at, forked_from_version_id FROM ${T.v3_versions}
+    `SELECT id, label, notes, author_id, created_at, forked_from_version_id, was_published, published_at FROM ${T.v3_versions}
      WHERE template_id = $1 ORDER BY created_at ASC`,
     [id],
   );
@@ -609,7 +820,11 @@ export async function getTemplate(req, res) {
   res.json({
     ...normalizeTemplate(tpl),
     page_groups: pageGroups,
-    pages: pages.map(normalizePage),
+    pages: pages.map((p) => {
+      const np = normalizePage(p);
+      const link = importLinkByName.get(p.name);
+      return link ? { ...np, is_imported: true, source: link } : np;
+    }),
     versions,
     active_version_id: versionId,
   });
@@ -758,7 +973,378 @@ export async function getPage(req, res) {
     [id],
   );
   if (!page) return res.status(404).json({ error: "Page not found" });
+
+  // Imported (linked) page: LIVE-MIRROR the SOURCE template's PUBLISHED page.
+  // The imported page is read-only; its content always reflects the current
+  // source. We write the resolved content through to this row so downstream
+  // readers (instances, print) see fresh data without re-resolving. Matched by
+  // (template_id, page_name) — stable across version forks; imported pages
+  // can't be renamed (see patchPage guard). Content fields ONLY are synced.
+  try {
+    await ensureImportTable(sql);
+    const link = await getImportLink(sql, page.template_id, page.name);
+    if (link) {
+      // DEFENSE: a link keyed only by (template_id, page_name) can end up
+      // ALIASED onto a locally-owned page — e.g. when a local copy is renamed
+      // onto the imported name, or when delete/rename ordering leaves a stale
+      // link row. Mirroring here would silently overwrite the user's local
+      // content and flip is_imported=TRUE, making the page read-only. If the
+      // stored row is already local (is_imported=false), treat the link as an
+      // orphan: drop it and return the local page unmodified.
+      if (page.is_imported === false) {
+        console.warn("[getPage] dropped orphan import link — local page aliased", {
+          templateId: page.template_id, pageName: page.name, pageId: page.id,
+          sourceTemplateId: link.source_template_id, sourcePageName: link.source_page_name,
+        });
+        try {
+          await sql.unsafe(
+            `DELETE FROM ${T.v3_page_imports} WHERE template_id = $1 AND page_name = $2`,
+            [page.template_id, page.name],
+          );
+        } catch (e) {
+          console.error("[getPage] orphan-link cleanup error:", e?.message || e);
+        }
+        return res.json(normalizePage(page));
+      }
+      const nsrc = await resolveImportedContent(
+        sql, link.source_template_id, link.source_page_name,
+      );
+      if (nsrc) {
+        await sql.unsafe(
+          `UPDATE ${T.v3_pages} SET
+             row_count = $2, col_count = $3, size = $4, orientation = $5, scale = $6,
+             columns_order = $7, column_widths = $8, row_heights = $9, cells = $10,
+             styles = $11, merges = $12, freeze_rows = $13, freeze_cols = $14,
+             is_imported = TRUE, updated_at = NOW()
+           WHERE id = $1`,
+          [
+            id, nsrc.row_count, nsrc.col_count, nsrc.size, nsrc.orientation, nsrc.scale,
+            nsrc.columns_order, nsrc.column_widths, nsrc.row_heights, nsrc.cells,
+            nsrc.styles, nsrc.merges, nsrc.freeze_rows, nsrc.freeze_cols,
+          ],
+        );
+        const merged = {
+          ...page, is_imported: true,
+          row_count: nsrc.row_count, col_count: nsrc.col_count, size: nsrc.size,
+          orientation: nsrc.orientation, scale: nsrc.scale,
+          columns_order: nsrc.columns_order, column_widths: nsrc.column_widths,
+          row_heights: nsrc.row_heights, cells: nsrc.cells, styles: nsrc.styles,
+          merges: nsrc.merges, freeze_rows: nsrc.freeze_rows, freeze_cols: nsrc.freeze_cols,
+        };
+        return res.json({ ...normalizePage(merged), source: link });
+      }
+      // Source unresolved (e.g. source has no published version / page renamed):
+      // return the last-synced stored copy, still flagged with its source link.
+      return res.json({ ...normalizePage(page), source: link });
+    }
+  } catch (e) {
+    console.error("[getPage] imported-page resolve error:", e?.message || e);
+  }
+
   res.json(normalizePage(page));
+}
+
+// ── Imported-page (cross-template linked page) helpers ────────────────────────
+// A retemplate can IMPORT a page from another retemplate. The imported page is a
+// READ-ONLY live mirror of the SOURCE template's published page — you edit it by
+// editing the source. Links live in v3_page_imports keyed by (template_id,
+// page_name) so they survive version forks (which copy pages by name) without
+// threading extra columns through every fork/restore/promote SQL block.
+const IMPORTED_LOCK_MSG =
+  "This page is imported from another template. Edit it in the source template — changes sync here automatically.";
+let _importTableEnsured = false;
+async function ensureImportTable(sql) {
+  if (_importTableEnsured) return;
+  await sql.unsafe(
+    `CREATE TABLE IF NOT EXISTS ${T.v3_page_imports} (
+       template_id        VARCHAR(24) NOT NULL,
+       page_name          TEXT NOT NULL,
+       source_template_id VARCHAR(24) NOT NULL,
+       source_page_name   TEXT NOT NULL,
+       created_at         TIMESTAMPTZ DEFAULT NOW(),
+       PRIMARY KEY (template_id, page_name)
+     )`,
+  );
+  _importTableEnsured = true;
+}
+async function getImportLink(sql, templateId, pageName) {
+  if (!templateId || pageName == null) return null;
+  const [row] = await sql.unsafe(
+    `SELECT template_id, page_name, source_template_id, source_page_name
+     FROM ${T.v3_page_imports} WHERE template_id = $1 AND page_name = $2 LIMIT 1`,
+    [templateId, pageName],
+  );
+  return row || null;
+}
+// Resolve the current content of a source page (published version preferred),
+// matched by name. Returns a normalized content object or null.
+async function resolveImportedContent(sql, sourceTemplateId, sourcePageName) {
+  if (!sourceTemplateId || !sourcePageName) return null;
+  const [st] = await sql.unsafe(
+    `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+    [sourceTemplateId],
+  );
+  const sv = st?.published_version_id || null;
+  const [pg] = await sql.unsafe(
+    `SELECT id, name, row_count, col_count, size, orientation, scale, columns_order,
+            column_widths, row_heights, cells, styles, merges, schemes,
+            freeze_rows, freeze_cols, print_settings
+     FROM ${T.v3_pages}
+     WHERE template_id = $1 AND name = $3 AND ($2::text IS NULL OR version_id = $2)
+     ORDER BY (version_id IS NOT DISTINCT FROM $2) DESC, ord ASC
+     LIMIT 1`,
+    [sourceTemplateId, sv, sourcePageName],
+  );
+  return pg ? normalizePage(pg) : null;
+}
+
+// ── POST /v3/pages/import ─────────────────────────────────────────────────────
+// Import a page from ANOTHER template as a read-only live mirror.
+// Body: { template_id, version_id?, source_template_id, source_page_name, name?, ord? }
+export async function importPage(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  if (!b.template_id || !b.source_template_id || !b.source_page_name) {
+    return res.status(400).json({
+      error: "template_id, source_template_id and source_page_name required",
+    });
+  }
+  if (b.source_template_id === b.template_id) {
+    return res.status(400).json({ error: "Cannot import a page from the same template" });
+  }
+  try {
+    await ensureImportTable(sql);
+    const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
+    if (!versionId) {
+      return res.status(400).json({ error: "Template has no published version yet" });
+    }
+    if (await isPublishedVersion(sql, b.template_id, versionId)) {
+      return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+    }
+    const nsrc = await resolveImportedContent(sql, b.source_template_id, b.source_page_name);
+    if (!nsrc) {
+      return res.status(404).json({
+        error: "Source page not found. The source template needs a published version containing that page.",
+      });
+    }
+    const name =
+      typeof b.name === "string" && b.name.trim() ? b.name.trim() : b.source_page_name;
+
+    const [dup] = await sql.unsafe(
+      `SELECT id FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2 AND name = $3 LIMIT 1`,
+      [b.template_id, versionId, name],
+    );
+    if (dup) {
+      return res.status(409).json({ error: `A page named "${name}" already exists in this version.` });
+    }
+
+    const [ordRow] = await sql.unsafe(
+      `SELECT COALESCE(MAX(ord), -1) AS max_ord FROM ${T.v3_pages}
+       WHERE template_id = $1 AND version_id = $2`,
+      [b.template_id, versionId],
+    );
+    const ord = Number.isFinite(b.ord) ? b.ord : (ordRow?.max_ord ?? -1) + 1;
+    const pid = newObjectId();
+
+    await sql.unsafe(
+      `INSERT INTO ${T.v3_pages}
+         (id, template_id, version_id, name, ord, row_count, col_count, size, orientation,
+          scale, hidden, is_imported, columns_order, column_widths, row_heights, cells,
+          styles, merges, freeze_rows, freeze_cols)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,TRUE,$11,$12,$13,$14,$15,$16,$17,$18)`,
+      [
+        pid, b.template_id, versionId, name, ord,
+        nsrc.row_count ?? 50, nsrc.col_count ?? 26, nsrc.size ?? null,
+        nsrc.orientation ?? null, nsrc.scale ?? null,
+        nsrc.columns_order ?? [], nsrc.column_widths ?? {}, nsrc.row_heights ?? {},
+        nsrc.cells ?? {}, nsrc.styles ?? {}, nsrc.merges ?? [],
+        nsrc.freeze_rows ?? 0, nsrc.freeze_cols ?? 0,
+      ],
+    );
+    await sql.unsafe(
+      `INSERT INTO ${T.v3_page_imports}
+         (template_id, page_name, source_template_id, source_page_name)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (template_id, page_name)
+         DO UPDATE SET source_template_id = EXCLUDED.source_template_id,
+                       source_page_name   = EXCLUDED.source_page_name`,
+      [b.template_id, name, b.source_template_id, b.source_page_name],
+    );
+
+    const [page] = await sql.unsafe(`SELECT * FROM ${T.v3_pages} WHERE id = $1 LIMIT 1`, [pid]);
+    broadcast({
+      type: "page.created",
+      templateId: b.template_id,
+      versionId,
+      pageId: pid,
+      pageName: name,
+      imported: true,
+      clientId: req.get("x-client-id") || null,
+    });
+    res.status(201).json({
+      ...normalizePage(page),
+      source: {
+        template_id: b.template_id,
+        page_name: name,
+        source_template_id: b.source_template_id,
+        source_page_name: b.source_page_name,
+      },
+    });
+  } catch (e) {
+    console.error("[importPage] error:", e?.message || e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+}
+
+// ── POST /v3/pages/:id/duplicate ──────────────────────────────────────────────
+// Create a LOCAL (non-imported) copy of a page in the SAME (template_id,
+// version_id). For imported sources we snapshot FRESH content from the source
+// template's published page (not the possibly-stale local mirror row).
+// Response 201: full page row (is_imported=false, no `source` field).
+export async function duplicatePage(req, res) {
+  const sql = getSql();
+  const { id: srcId } = req.params;
+  try {
+    await ensureImportTable(sql);
+
+    const [src] = await sql.unsafe(
+      `SELECT * FROM ${T.v3_pages} WHERE id = $1 LIMIT 1`,
+      [srcId],
+    );
+    if (!src) return res.status(404).json({ error: "Page not found" });
+    if (await isPublishedVersion(sql, src.template_id, src.version_id)) {
+      return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
+    }
+    // Defensive: real page rows should always have a name, but avoid
+    // producing " (2)" if the source row somehow has an empty/whitespace name.
+    const srcName = String(src.name || "").trim() || "Untitled";
+
+    // If the source is imported, snapshot FRESH content from the source
+    // template's published page rather than copying the local mirror row
+    // (which may be stale).
+    let contentRow = src;
+    if (src.is_imported) {
+      const link = await getImportLink(sql, src.template_id, src.name);
+      if (link) {
+        const nsrc = await resolveImportedContent(
+          sql, link.source_template_id, link.source_page_name,
+        );
+        if (nsrc) contentRow = { ...src, ...nsrc };
+      }
+    }
+
+    const newId = newObjectId();
+    let inserted;
+    await sql.begin(async (tx) => {
+      // Advisory lock serializes name-picks + inserts per (template, version)
+      // so two concurrent duplicates cannot both compute the same "(2)" suffix.
+      const lockKey = `${src.template_id}:${src.version_id}`;
+      await tx.unsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKey]);
+
+      const newName = await pickUniqueCopyName(
+        tx, src.template_id, src.version_id, srcName,
+      );
+
+      const nextFreeOrd = async () => {
+        const [row] = await tx.unsafe(
+          `SELECT COALESCE(MAX(ord), -1) AS max_ord FROM ${T.v3_pages}
+           WHERE template_id = $1 AND version_id = $2`,
+          [src.template_id, src.version_id],
+        );
+        return (row?.max_ord ?? -1) + 1;
+      };
+      let ord = await nextFreeOrd();
+
+      const doInsert = (ordVal) =>
+        tx.unsafe(
+          `INSERT INTO ${T.v3_pages} (
+             id, template_id, version_id, name, ord,
+             row_count, col_count, size, orientation, scale,
+             hidden, is_imported,
+             columns_order, column_widths, row_heights,
+             cells, styles, merges, schemes,
+             freeze_rows, freeze_cols, print_settings
+           ) VALUES (
+             $1,$2,$3,$4,$5, $6,$7,$8,$9,$10, FALSE,FALSE,
+             $11,$12,$13, $14,$15,$16,$17, $18,$19,$20)
+           RETURNING *`,
+          [
+            newId, src.template_id, src.version_id, newName, ordVal,
+            contentRow.row_count ?? 50, contentRow.col_count ?? 26,
+            contentRow.size ?? null, contentRow.orientation ?? null, contentRow.scale ?? null,
+            contentRow.columns_order ?? [], contentRow.column_widths ?? {}, contentRow.row_heights ?? {},
+            contentRow.cells ?? {}, contentRow.styles ?? {}, contentRow.merges ?? [],
+            contentRow.schemes ?? [],
+            contentRow.freeze_rows ?? 0, contentRow.freeze_cols ?? 0,
+            contentRow.print_settings ?? {},
+          ],
+        );
+
+      try {
+        const [row] = await doInsert(ord);
+        inserted = row;
+      } catch (e) {
+        if (e?.code === "23505" && /ord/.test(String(e?.constraint_name || ""))) {
+          ord = await nextFreeOrd();
+          const [row] = await doInsert(ord);
+          inserted = row;
+        } else { throw e; }
+      }
+    });
+
+    broadcast({
+      type: "page.created",
+      templateId: inserted.template_id,
+      versionId: inserted.version_id,
+      pageId: inserted.id,
+      pageName: inserted.name,
+      clientId: req.get("x-client-id") || null,
+    });
+    res.status(201).json(normalizePage(inserted));
+  } catch (e) {
+    console.error("[duplicatePage] error:", e?.message || e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+}
+
+// Windows-Explorer style suffix helpers used by duplicatePage. Strip trailing
+// " (N)" so duplicating "Foo (2)" still uses base "Foo", then pick the
+// smallest N>=2 whose "<base> (N)" isn't taken (case-insensitive, matches the
+// FE calc engine's name resolution).
+function stripCopySuffix(name) {
+  const m = String(name || "").match(/^(.*?)\s*\((\d+)\)\s*$/);
+  return m ? m[1] : String(name || "");
+}
+async function pickUniqueCopyName(sql, templateId, versionId, srcName) {
+  const base = stripCopySuffix(srcName);
+  const escaped = base.replace(/([.^$*+?()\[\]{}\\|])/g, "\\$1");
+  // UNION in any names claimed by v3_page_imports so a fresh duplicate never
+  // gets born aliased to an existing (or stale) import link. Without this a
+  // copy could be named onto a link key, and the next getPage would mirror-
+  // clobber it.
+  const rows = await sql.unsafe(
+    `SELECT name FROM ${T.v3_pages}
+      WHERE template_id = $1 AND version_id = $2
+        AND (LOWER(name) = LOWER($3)
+             OR LOWER(name) ~ ('^' || LOWER($4) || ' \\(\\d+\\)$'))
+     UNION
+     SELECT page_name AS name FROM ${T.v3_page_imports}
+      WHERE template_id = $1
+        AND (LOWER(page_name) = LOWER($3)
+             OR LOWER(page_name) ~ ('^' || LOWER($4) || ' \\(\\d+\\)$'))`,
+    [templateId, versionId, base, escaped],
+  );
+  const taken = new Set();
+  const baseLower = base.toLowerCase();
+  for (const r of rows) {
+    const nm = String(r.name || "").toLowerCase();
+    if (nm === baseLower) { taken.add(1); continue; }
+    const m = nm.match(/\((\d+)\)$/);
+    if (m) taken.add(parseInt(m[1], 10));
+  }
+  let n = 2;
+  while (taken.has(n)) n++;
+  return `${base} (${n})`;
 }
 
 // ── Group name-reference helpers ──────────────────────────────────────────────
@@ -1228,7 +1814,9 @@ export async function reorderMasterInputGroups(req, res) {
 // Page fields that are purely cosmetic / view-only — allowed even on the
 // published (locked) version, since they don't change the released content or
 // calculations. A patch touching ONLY these skips the publish lock.
-const COSMETIC_PAGE_FIELDS = new Set(["freeze_rows", "freeze_cols", "print_settings"]);
+// `hidden` (admin toggle to hide a page from regular users) is view-only too —
+// it changes who sees the tab, not the released content — so it belongs here.
+const COSMETIC_PAGE_FIELDS = new Set(["freeze_rows", "freeze_cols", "print_settings", "hidden"]);
 
 export async function patchPage(req, res) {
   const sql = getSql();
@@ -1239,6 +1827,51 @@ export async function patchPage(req, res) {
   if (!cosmeticOnly && (await rowIsPublished(sql, T.v3_pages, id))) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
+
+  // Imported (linked) pages are read-only mirrors — content is edited in the
+  // SOURCE template and synced on read. Allow only local, non-content fields
+  // (visibility / order / freeze / print); reject anything that mutates the
+  // mirrored content or the page name (the name is the link key).
+  const IMPORT_ALLOWED_FIELDS = new Set(["hidden", "ord", "freeze_rows", "freeze_cols", "print_settings"]);
+  const wantsContentEdit = bodyKeys.some((k) => !IMPORT_ALLOWED_FIELDS.has(k));
+  if (wantsContentEdit) {
+    try {
+      await ensureImportTable(sql);
+      const [prow] = await sql.unsafe(
+        `SELECT template_id, name FROM ${T.v3_pages} WHERE id = $1 LIMIT 1`,
+        [id],
+      );
+      if (prow) {
+        const link = await getImportLink(sql, prow.template_id, prow.name);
+        if (link) return res.status(403).json({ error: IMPORTED_LOCK_MSG, source: link });
+      }
+    } catch (e) {
+      console.error("[patchPage] imported-page guard error:", e?.message || e);
+    }
+  }
+
+  // Local-page rename → link cleanup. If a local (is_imported=false) page is
+  // being renamed onto a name that already has an import link, the link would
+  // alias the local page on the next read and (per getPage's mirror) clobber
+  // its content. Drop the stale link proactively so the rename is safe.
+  if (typeof req.body?.name === "string") {
+    try {
+      await ensureImportTable(sql);
+      const [cur] = await sql.unsafe(
+        `SELECT template_id, name, is_imported FROM ${T.v3_pages} WHERE id = $1 LIMIT 1`,
+        [id],
+      );
+      if (cur && cur.is_imported === false && cur.name !== req.body.name) {
+        await sql.unsafe(
+          `DELETE FROM ${T.v3_page_imports} WHERE template_id = $1 AND page_name = $2`,
+          [cur.template_id, req.body.name],
+        );
+      }
+    } catch (e) {
+      console.error("[patchPage] rename link-cleanup error:", e?.message || e);
+    }
+  }
+
   const { cells, removeCells, styles, removeStyles, merges, name, hidden, ord, schemes, column_widths, row_heights } = req.body || {};
 
   const updates = [];
@@ -1393,10 +2026,34 @@ export async function deletePage(req, res) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
   const result = await sql.unsafe(
-    `DELETE FROM ${T.v3_pages} WHERE id = $1 RETURNING id`,
+    `DELETE FROM ${T.v3_pages} WHERE id = $1 RETURNING id, template_id, name`,
     [id],
   );
   if (!result.length) return res.status(404).json({ error: "Page not found" });
+  // If no IMPORTED copies of this name remain (across all versions), drop the
+  // import link so the row doesn't dangle. Restricting the check to
+  // is_imported=TRUE is critical: a local copy that happens to share the name
+  // (e.g. a renamed duplicate) must NOT keep the link alive, otherwise the
+  // next getPage would alias the link onto the local copy and mirror-clobber
+  // it. Other imported versions with the same name keep the link.
+  try {
+    const { template_id, name } = result[0];
+    const remaining = await sql.unsafe(
+      `SELECT 1 FROM ${T.v3_pages}
+       WHERE template_id = $1 AND name = $2 AND is_imported = TRUE
+       LIMIT 1`,
+      [template_id, name],
+    );
+    if (!remaining.length) {
+      await ensureImportTable(sql);
+      await sql.unsafe(
+        `DELETE FROM ${T.v3_page_imports} WHERE template_id = $1 AND page_name = $2`,
+        [template_id, name],
+      );
+    }
+  } catch (e) {
+    console.error("[deletePage] import-link cleanup error:", e?.message || e);
+  }
   res.json({ ok: true, id });
 }
 
@@ -1410,6 +2067,31 @@ async function ensureVerForkCol(sql) {
   if (_v3VerForkColEnsured) return;
   try {
     await sql.unsafe(`ALTER TABLE ${T.v3_versions} ADD COLUMN IF NOT EXISTS forked_from_version_id VARCHAR(24)`);
+    // `was_published` marks any version that is, or ever was, the published
+    // release. Such versions are LOCKED forever (preserved for versioning) — to
+    // change one you fork it into a fresh editable draft. `published_at` records
+    // when it first went live.
+    await sql.unsafe(`ALTER TABLE ${T.v3_versions} ADD COLUMN IF NOT EXISTS was_published BOOLEAN NOT NULL DEFAULT FALSE`);
+    await sql.unsafe(`ALTER TABLE ${T.v3_versions} ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ`);
+    // Backfill from the pre-flag data: every template's CURRENT published version,
+    // plus any legacy "ex-published ·…" labelled snapshots (the old name-based
+    // heuristic), become was_published so history stays correct.
+    await sql.unsafe(
+      `UPDATE ${T.v3_versions} v SET was_published = TRUE
+         FROM ${T.v3_templates} t
+        WHERE t.published_version_id = v.id AND v.was_published = FALSE`,
+    );
+    await sql.unsafe(
+      `UPDATE ${T.v3_versions} SET was_published = TRUE
+        WHERE was_published = FALSE AND label ILIKE 'ex-published%'`,
+    );
+    // Pre-flag locked versions have no recorded publish date — approximate it
+    // with created_at so "Last published" shows something sensible instead of
+    // "Never published". New publishes stamp the exact time.
+    await sql.unsafe(
+      `UPDATE ${T.v3_versions} SET published_at = created_at
+        WHERE was_published = TRUE AND published_at IS NULL`,
+    );
   } catch {}
   _v3VerForkColEnsured = true;
 }
@@ -1418,7 +2100,7 @@ export async function listVersions(req, res) {
   const sql = getSql();
   await ensureVerForkCol(sql);
   const rows = await sql.unsafe(
-    `SELECT id, label, notes, author_id, created_at, forked_from_version_id FROM ${T.v3_versions}
+    `SELECT id, label, notes, author_id, created_at, forked_from_version_id, was_published, published_at FROM ${T.v3_versions}
      WHERE template_id = $1 ORDER BY created_at ASC`,
     [req.params.id],
   );
@@ -1621,6 +2303,23 @@ export async function createVersion(req, res) {
     return res.status(500).json({ error: `Create version failed: ${e.message}` });
   }
 
+  // The report FAQ is version-scoped — a fork inherits the source version's FAQ
+  // (incl. its per-version cell / master-input refs). Non-fatal: never let an
+  // FAQ-copy hiccup fail the version creation itself.
+  if (sourceVersionId) {
+    try { await copyFaqForVersion(sql, templateId, sourceVersionId, newVersionId); }
+    catch (e) { console.error("[createVersion] FAQ copy failed:", e?.message || e); }
+    // The report dashboard is version-scoped too — a fork inherits the source
+    // version's widgets (incl. their per-version cell refs). Non-fatal.
+    try { await copyDashboardForVersion(sql, templateId, sourceVersionId, newVersionId); }
+    catch (e) { console.error("[createVersion] dashboard copy failed:", e?.message || e); }
+    // The report workflow is version-scoped so a fork inherits the source's
+    // steps; instances stay on the published version until the fork is
+    // published. Non-fatal — never let a workflow-copy hiccup fail version fork.
+    try { await copyPiwForVersion(sql, templateId, sourceVersionId, newVersionId); }
+    catch (e) { console.error("[createVersion] workflow copy failed:", e?.message || e); }
+  }
+
   const [version] = await sql.unsafe(
     `SELECT * FROM ${T.v3_versions} WHERE id = $1`,
     [newVersionId],
@@ -1802,6 +2501,16 @@ export async function restoreVersion(req, res) {
       [targetVersionId, sourceVersionId],
     );
 
+    // Side-configs (FAQ, dashboard, workflow) are version-scoped in their own
+    // JSONB payload slots — copy the source version's slot into the target so
+    // a restore fully mirrors the source (not just the pages/MIs). Non-fatal.
+    try { await copyFaqForVersion(sql, templateId, sourceVersionId, targetVersionId); }
+    catch (e) { console.error("[restoreVersion] FAQ copy failed:", e?.message || e); }
+    try { await copyDashboardForVersion(sql, templateId, sourceVersionId, targetVersionId); }
+    catch (e) { console.error("[restoreVersion] dashboard copy failed:", e?.message || e); }
+    try { await copyPiwForVersion(sql, templateId, sourceVersionId, targetVersionId); }
+    catch (e) { console.error("[restoreVersion] workflow copy failed:", e?.message || e); }
+
     emit({ phase: "done" });
     res.end();
   } catch (e) {
@@ -1829,6 +2538,13 @@ export async function publishVersion(req, res) {
   );
   if (!v) return res.status(404).json({ error: "Version not found for this template" });
 
+  // The version currently live — it's about to be superseded by this publish.
+  const [curTpl] = await sql.unsafe(
+    `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+    [templateId],
+  );
+  const oldPublishedId = curTpl?.published_version_id || null;
+
   try {
     await sql.begin(async (tx) => {
       if (label && String(label).trim()) {
@@ -1836,6 +2552,33 @@ export async function publishVersion(req, res) {
           String(label).trim(),
           version_id,
         ]);
+      }
+      // Mark the previously-published version as "ex-published" so it stays
+      // identifiable in the version history / "Previously published" filter,
+      // consistent with Push to Publish. Publishing doesn't destroy it — it
+      // survives intact, just re-labelled and no longer the live version.
+      if (oldPublishedId && oldPublishedId !== version_id) {
+        const [old] = await tx.unsafe(
+          `SELECT label FROM ${T.v3_versions} WHERE id = $1 LIMIT 1`,
+          [oldPublishedId],
+        );
+        const oldLabel = (old?.label && String(old.label).trim()) || oldPublishedId.slice(0, 8);
+        if (!/^\s*ex-published/i.test(oldLabel)) {
+          await tx.unsafe(
+            `UPDATE ${T.v3_versions} SET label = $1 WHERE id = $2`,
+            [`ex-published · ${oldLabel} · ${new Date().toISOString().slice(0, 10)}`, oldPublishedId],
+          );
+        }
+      }
+      // Both the newly-published version and the one it supersedes are locked
+      // forever (was_published) — the release history is immutable. published_at
+      // records the LAST time this version went live.
+      await tx.unsafe(
+        `UPDATE ${T.v3_versions} SET was_published = TRUE, published_at = NOW() WHERE id = $1`,
+        [version_id],
+      );
+      if (oldPublishedId && oldPublishedId !== version_id) {
+        await tx.unsafe(`UPDATE ${T.v3_versions} SET was_published = TRUE WHERE id = $1`, [oldPublishedId]);
       }
       await tx.unsafe(
         `UPDATE ${T.v3_templates} SET published_version_id = $1, updated_at = NOW() WHERE id = $2`,
@@ -2135,6 +2878,49 @@ export async function pushToPublished(req, res) {
   if (pages.length === 0 && sections.length === 0 && masterInputs.length === 0) {
     return res.status(400).json({ error: "Nothing to push — the source version is empty" });
   }
+
+  // Snapshot the CURRENT published version before Push overwrites its content,
+  // so the pre-push published state is never lost. Fatal on failure — we never
+  // overwrite the live version without a preserved "ex-published" backup.
+  try {
+    const [pub] = await sql.unsafe(
+      `SELECT label, published_at FROM ${T.v3_versions} WHERE id = $1 LIMIT 1`,
+      [targetVersionId],
+    );
+    const oldLabel = (pub?.label && String(pub.label).trim()) || targetVersionId.slice(0, 8);
+    const snapLabel = `ex-published · ${oldLabel} · ${new Date().toISOString().slice(0, 10)}`;
+    const snapId = newObjectId();
+    await ensureVerForkCol(sql);
+    await sql.begin(async (tx) => {
+      // The snapshot preserves a published state, so it is itself locked
+      // (was_published). Its `published_at` is the date THAT content was live —
+      // i.e. the target's current published_at (fallback now).
+      await tx.unsafe(
+        `INSERT INTO ${T.v3_versions} (id, template_id, label, forked_from_version_id, was_published, published_at)
+         VALUES ($1, $2, $3, $4, TRUE, COALESCE($5::timestamptz, NOW()))`,
+        [snapId, templateId, snapLabel, targetVersionId, pub?.published_at || null],
+      );
+      await copyVersionContentInTx(tx, templateId, targetVersionId, snapId);
+      // The published version is being re-published (new content) right now.
+      await tx.unsafe(`UPDATE ${T.v3_versions} SET published_at = NOW() WHERE id = $1`, [targetVersionId]);
+    });
+  } catch (e) {
+    return res.status(500).json({
+      error: `Could not snapshot the current published version before pushing: ${e.message}`,
+    });
+  }
+
+  // Version-scoped side-configs (FAQ, dashboard, workflow) stay in their own
+  // slot per version, so promoting cells+MIs alone doesn't sync them. Copy the
+  // source version's slot into the target (published) slot so a "push to
+  // publish" carries the report FAQ, dashboard widgets, and workflow steps
+  // along with the content. Non-fatal — mirror the createVersion pattern.
+  try { await copyFaqForVersion(sql, templateId, sourceVersionId, targetVersionId); }
+  catch (e) { console.error("[pushToPublished] FAQ copy failed:", e?.message || e); }
+  try { await copyDashboardForVersion(sql, templateId, sourceVersionId, targetVersionId); }
+  catch (e) { console.error("[pushToPublished] dashboard copy failed:", e?.message || e); }
+  try { await copyPiwForVersion(sql, templateId, sourceVersionId, targetVersionId); }
+  catch (e) { console.error("[pushToPublished] workflow copy failed:", e?.message || e); }
 
   // Delegate to the existing, tested promote path with the full lists.
   req.body = { sourceVersionId, targetVersionId, pages, sections, masterInputs };
@@ -2975,54 +3761,247 @@ export async function patchInstanceMasterInput(req, res) {
   res.json(normalizeMasterInput(row));
 }
 
+// POST /v3/instances/:instanceId/master-inputs/bulk — { items: [{ template_mi_id, value }] }
+// Seed/replace many overrides in ONE round-trip (used by "make in another scheme",
+// which can carry 900+ values — one PATCH each would be hundreds of requests).
+export async function bulkPatchInstanceMasterInputs(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  const items = Array.isArray(b.items) ? b.items : [];
+  const { instanceId } = req.params;
+
+  const perm = await checkInstancePermission(sql, instanceId, requesterId(req));
+  if (!perm.ok) return res.status(perm.status).json({ error: perm.error });
+  if (perm.inst && !perm.inst.user_id) {
+    const uid = requesterId(req);
+    if (uid) await sql.unsafe(`UPDATE ${T.v3_instances} SET user_id = $1 WHERE id = $2 AND user_id IS NULL`, [String(uid), instanceId]);
+  }
+  if (!items.length) return res.json({ updated: 0 });
+
+  // Resolve each template MI's stable key in one query.
+  const ids = [...new Set(items.map((it) => String(it.template_mi_id || "")).filter(Boolean))];
+  if (!ids.length) return res.json({ updated: 0 });
+  const keyRows = await sql.unsafe(`SELECT id, key FROM ${T.master_input} WHERE id = ANY($1::text[])`, [ids]);
+  const keyById = Object.fromEntries(keyRows.map((r) => [r.id, r.key]));
+
+  // Dedupe by key (last write wins) so the multi-row upsert can't touch a row twice.
+  const byKey = new Map();
+  for (const it of items) {
+    const miId = String(it.template_mi_id || "");
+    const key = keyById[miId];
+    if (!key) continue;
+    byKey.set(key, { miId, value: it.value == null ? null : String(it.value) });
+  }
+  if (!byKey.size) return res.json({ updated: 0 });
+
+  const values = []; const params = []; let p = 1;
+  for (const [key, { miId, value }] of byKey) {
+    values.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
+    params.push(newObjectId(), instanceId, miId, key, value);
+  }
+  await sql.unsafe(
+    `INSERT INTO ${T.instance_mi} (id, instance_id, template_mi_id, template_mi_key, value)
+     VALUES ${values.join(",")}
+     ON CONFLICT (instance_id, template_mi_key)
+     DO UPDATE SET value = EXCLUDED.value, template_mi_id = EXCLUDED.template_mi_id`,
+    params,
+  );
+  res.json({ updated: byKey.size });
+}
+
+// ── Instance links (live 2-way mimic) ────────────────────────────────────────
+// A link mirrors master-input values between two instances across a key mapping
+// (identical keys for the same scheme; source→target keys for a different one).
+let _linkTablesEnsured = null;
+function ensureLinkTables() {
+  if (_linkTablesEnsured) return _linkTablesEnsured;
+  const sql = getSql();
+  _linkTablesEnsured = sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.instance_links} (
+        id VARCHAR(24) PRIMARY KEY,
+        instance_a VARCHAR(24) NOT NULL,
+        instance_b VARCHAR(24) NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'mimic',
+        pairs JSONB NOT NULL DEFAULT '[]',
+        name_a TEXT, name_b TEXT, cnt INTEGER DEFAULT 0, active BOOLEAN DEFAULT TRUE,
+        user_id VARCHAR(24),
+        created_at TIMESTAMPTZ DEFAULT NOW())`)
+    .then(() => sql.unsafe(`ALTER TABLE ${T.instance_links} ADD COLUMN IF NOT EXISTS name_a TEXT`))
+    .then(() => sql.unsafe(`ALTER TABLE ${T.instance_links} ADD COLUMN IF NOT EXISTS name_b TEXT`))
+    .then(() => sql.unsafe(`ALTER TABLE ${T.instance_links} ADD COLUMN IF NOT EXISTS cnt INTEGER DEFAULT 0`))
+    .then(() => sql.unsafe(`ALTER TABLE ${T.instance_links} ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE`))
+    .then(() => sql.unsafe(`CREATE INDEX IF NOT EXISTS v3_instance_links_a_idx ON ${T.instance_links} (instance_a)`))
+    .then(() => sql.unsafe(`CREATE INDEX IF NOT EXISTS v3_instance_links_b_idx ON ${T.instance_links} (instance_b)`))
+    .catch((e) => { _linkTablesEnsured = null; throw e; });
+  return _linkTablesEnsured;
+}
+
+// POST /v3/instance-links — { instance_a, instance_b, mode?, pairs?, name_a?, name_b?, cnt?, user_id? }
+export async function createInstanceLink(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  if (!b.instance_a || !b.instance_b) return res.status(400).json({ error: "instance_a and instance_b required" });
+  try {
+    await ensureLinkTables();
+    const id = newObjectId();
+    const pairs = Array.isArray(b.pairs) ? b.pairs : [];
+    await sql.unsafe(
+      `INSERT INTO ${T.instance_links} (id, instance_a, instance_b, mode, pairs, name_a, name_b, cnt, user_id)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9)`,
+      [id, String(b.instance_a), String(b.instance_b), b.mode ? String(b.mode) : "mimic", JSON.stringify(pairs),
+       b.name_a != null ? String(b.name_a) : null, b.name_b != null ? String(b.name_b) : null,
+       Number.isFinite(+b.cnt) ? Math.trunc(+b.cnt) : pairs.length, b.user_id ? String(b.user_id) : (requesterId(req) || null)],
+    );
+    const [row] = await sql.unsafe(`SELECT * FROM ${T.instance_links} WHERE id = $1 LIMIT 1`, [id]);
+    res.status(201).json(row);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
+// GET /v3/instance-links?instance_ids=a,b,c — every link touching any of the ids.
+export async function listInstanceLinks(req, res) {
+  const sql = getSql();
+  try {
+    await ensureLinkTables();
+    const raw = req.query.instance_ids || req.query.instance_id || "";
+    const ids = String(raw).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!ids.length) return res.json({ links: [] });
+    const rows = await sql.unsafe(
+      `SELECT * FROM ${T.instance_links}
+        WHERE instance_a = ANY($1::text[]) OR instance_b = ANY($1::text[])
+        ORDER BY created_at DESC LIMIT 500`,
+      [ids],
+    );
+    res.json({ links: rows });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
+// PATCH /v3/instance-links/:id — { pairs?, cnt?, mode? } — edit which inputs a
+// live match mirrors (or re-activate it).
+export async function patchInstanceLink(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    await ensureLinkTables();
+    const sets = []; const params = []; let p = 1;
+    if (b.pairs !== undefined) { sets.push(`pairs = $${p++}::jsonb`); params.push(JSON.stringify(Array.isArray(b.pairs) ? b.pairs : [])); }
+    if (b.cnt !== undefined) { sets.push(`cnt = $${p++}`); params.push(Number.isFinite(+b.cnt) ? Math.trunc(+b.cnt) : 0); }
+    if (b.mode !== undefined) { sets.push(`mode = $${p++}`); params.push(String(b.mode)); }
+    if (b.active !== undefined) { sets.push(`active = $${p++}`); params.push(!!b.active); }
+    if (!sets.length) return res.json({ ok: true });
+    params.push(req.params.id);
+    await sql.unsafe(`UPDATE ${T.instance_links} SET ${sets.join(", ")} WHERE id = $${p}`, params);
+    const [row] = await sql.unsafe(`SELECT * FROM ${T.instance_links} WHERE id = $1 LIMIT 1`, [req.params.id]);
+    res.json(row || { ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
+// DELETE /v3/instance-links/:id — turn OFF a live match. Soft-delete: mark it
+// inactive (mirroring stops) but keep the record so it stays in the history.
+export async function deleteInstanceLink(req, res) {
+  const sql = getSql();
+  try {
+    await ensureLinkTables();
+    await sql.unsafe(`UPDATE ${T.instance_links} SET active = FALSE WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
 // ── Post-Instance Workflow config (admin: /admin/post-instance-workflow) ──────
-// Per-retemplate JSONB: { common: [...steps]|null, perCalc: { <calcName>: [...steps] } }.
-// The instance viewer's Workflow drawer renders common + the calc-specific steps.
+// Per-retemplate JSONB: { steps: [...steps] }. Each retemplate is now a single
+// scheme (the monolith was split), so a workflow is just the ordered step list
+// for THIS retemplate — no scope/common/perCalc partitioning.
 async function ensurePiwTable(sql) {
   await sql
     .unsafe(`CREATE TABLE IF NOT EXISTS ${T.piw} (retemplate_id VARCHAR(24) PRIMARY KEY, payload JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ DEFAULT NOW())`)
     .catch(() => {});
 }
 
-// GET /v3/post-instance-workflow/:retemplateId
+// Flatten a legacy { common, perCalc } payload into a single steps[] so no
+// configured step is lost when reading old rows. New rows carry { steps }.
+function piwSteps(p) {
+  if (Array.isArray(p?.steps)) return p.steps;
+  const out = Array.isArray(p?.common) ? [...p.common] : [];
+  if (p?.perCalc && typeof p.perCalc === "object" && !Array.isArray(p.perCalc)) {
+    for (const v of Object.values(p.perCalc)) if (Array.isArray(v)) out.push(...v);
+  }
+  return out;
+}
+
+// Version-scoped: pull the steps[] for a specific version, falling back to the
+// top-level legacy payload when the version has no doc yet. Same pattern as
+// faqDocFor — instances see the published version's workflow, edits in the
+// draft don't leak out until the draft is published.
+function piwStepsFor(payload, versionId) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const byVer = p.versions && typeof p.versions === "object" && !Array.isArray(p.versions) ? p.versions : {};
+  if (versionId && byVer[versionId] && Array.isArray(byVer[versionId].steps)) {
+    return byVer[versionId].steps;
+  }
+  return piwSteps(p);
+}
+
+// Copy a template's workflow doc from one version to another (on version fork
+// so a new draft inherits the source's workflow). Non-fatal.
+async function copyPiwForVersion(sql, templateId, sourceVersionId, newVersionId) {
+  if (!templateId || !sourceVersionId || !newVersionId) return;
+  await ensurePiwTable(sql);
+  const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw} WHERE retemplate_id = $1 LIMIT 1`, [templateId]);
+  if (!row) return;
+  const cur = parseJsonbStr(row.payload, {});
+  const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+  const srcSteps = (byVer[sourceVersionId] && Array.isArray(byVer[sourceVersionId].steps))
+    ? byVer[sourceVersionId].steps
+    : piwSteps(cur);
+  if (!Array.isArray(srcSteps) || srcSteps.length === 0) return;
+  const next = { ...cur, versions: { ...byVer, [newVersionId]: { steps: srcSteps } } };
+  await sql.unsafe(
+    `INSERT INTO ${T.piw} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+    [templateId, JSON.stringify(next)],
+  );
+}
+
+// GET /v3/post-instance-workflow/:retemplateId?version=<id> → { steps, version_id }
+// Instances hit this with no ?version, so they get the PUBLISHED version's
+// workflow. Editor sends ?version=<draftId> to load whatever it's editing.
 export async function getPostInstanceWorkflow(req, res) {
   const sql = getSql();
   try {
     await ensurePiwTable(sql);
-    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw} WHERE retemplate_id = $1 LIMIT 1`, [req.params.retemplateId]);
+    const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, req.query.version);
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
     const p = row ? parseJsonbStr(row.payload, {}) : {};
-    res.json({
-      common: Array.isArray(p.common) ? p.common : null,
-      perCalc: p.perCalc && typeof p.perCalc === "object" && !Array.isArray(p.perCalc) ? p.perCalc : {},
-    });
+    res.json({ steps: piwStepsFor(p, versionId), version_id: versionId });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 }
 
-// PUT /v3/post-instance-workflow/:retemplateId — body { common?, perCalc? }.
-// Merges with the stored config so a common-only or calc-only save keeps the rest.
+// PUT /v3/post-instance-workflow/:retemplateId — body { steps, version_id? }
+// (?version= also accepted). Writes to the given version's slot; other
+// versions untouched. Defaults to the template's published version — but the
+// editor should always send ?version=<activeVersionId> so a draft save never
+// mutates the published workflow.
 export async function savePostInstanceWorkflow(req, res) {
   const sql = getSql();
   const b = req.body || {};
   try {
     await ensurePiwTable(sql);
     const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, b.version_id || req.query.version);
+    if (!versionId) return res.status(400).json({ error: "Template has no version to attach the workflow to" });
     const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
     const cur = row ? parseJsonbStr(row.payload, {}) : {};
-    const next = {
-      common: Array.isArray(b.common) ? b.common : (Array.isArray(cur.common) ? cur.common : null),
-      perCalc: {
-        ...(cur.perCalc && typeof cur.perCalc === "object" ? cur.perCalc : {}),
-        ...(b.perCalc && typeof b.perCalc === "object" ? b.perCalc : {}),
-      },
-    };
+    const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+    const nextSteps = Array.isArray(b.steps) ? b.steps : piwStepsFor(cur, versionId);
+    const next = { ...cur, versions: { ...byVer, [versionId]: { steps: nextSteps } } };
     await sql.unsafe(
       `INSERT INTO ${T.piw} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
        ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
       [rid, JSON.stringify(next)],
     );
-    res.json({ ok: true, ...next });
+    res.json({ ok: true, version_id: versionId, steps: nextSteps });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
@@ -3038,43 +4017,491 @@ async function ensurePiwFaqTable(sql) {
 }
 
 // GET /v3/post-instance-faq/:retemplateId
+// ── Version-scoped report FAQ ─────────────────────────────────────────────────
+// The report FAQ is authored in the retemplate editor and is VERSION-SCOPED so
+// that cell / master-input references (which can sit at different addresses in
+// different versions) stay correct per version. Storage stays a single row per
+// template (v3_post_instance_faq, PK retemplate_id) — the versioning lives in
+// the JSON payload:  payload.versions[versionId] = { common: [faq...], perCalc }.
+// A LEGACY payload had { common, perCalc } at the top level; it's the fallback
+// for any version that has no doc of its own yet (so old FAQs keep showing until
+// re-saved per version).
+function faqDocFor(payload, versionId) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const byVer = p.versions && typeof p.versions === "object" && !Array.isArray(p.versions) ? p.versions : {};
+  const legacy = {
+    common: Array.isArray(p.common) ? p.common : null,
+    perCalc: p.perCalc && typeof p.perCalc === "object" && !Array.isArray(p.perCalc) ? p.perCalc : {},
+  };
+  const doc = versionId && byVer[versionId] ? byVer[versionId] : legacy;
+  return {
+    common: Array.isArray(doc.common) ? doc.common : null,
+    perCalc: doc.perCalc && typeof doc.perCalc === "object" && !Array.isArray(doc.perCalc) ? doc.perCalc : {},
+    sections: Array.isArray(doc.sections) ? doc.sections : [],
+  };
+}
+
+// Copy a template's FAQ doc from one version to another (used on version fork so
+// a new version inherits the source's FAQ + its per-version refs). Non-fatal.
+async function copyFaqForVersion(sql, templateId, sourceVersionId, newVersionId) {
+  if (!templateId || !sourceVersionId || !newVersionId) return;
+  await ensurePiwFaqTable(sql);
+  const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw_faq} WHERE retemplate_id = $1 LIMIT 1`, [templateId]);
+  if (!row) return;
+  const cur = parseJsonbStr(row.payload, {});
+  const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+  const srcDoc = byVer[sourceVersionId] || (
+    Array.isArray(cur.common) || (cur.perCalc && typeof cur.perCalc === "object")
+      ? { common: Array.isArray(cur.common) ? cur.common : [], perCalc: cur.perCalc && typeof cur.perCalc === "object" ? cur.perCalc : {} }
+      : null
+  );
+  if (!srcDoc) return;
+  const next = { ...cur, versions: { ...byVer, [newVersionId]: srcDoc } };
+  await sql.unsafe(
+    `INSERT INTO ${T.piw_faq} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+    [templateId, JSON.stringify(next)],
+  );
+}
+
+// GET /v3/post-instance-faq/:retemplateId?version=<id>
+// Returns the FAQ for the given version (defaults to the template's published
+// version). Shape: { common, perCalc, version_id }.
 export async function getPostInstanceFaq(req, res) {
   const sql = getSql();
   try {
     await ensurePiwFaqTable(sql);
-    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw_faq} WHERE retemplate_id = $1 LIMIT 1`, [req.params.retemplateId]);
+    const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, req.query.version);
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw_faq} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
     const p = row ? parseJsonbStr(row.payload, {}) : {};
-    res.json({
-      common: Array.isArray(p.common) ? p.common : null,
-      perCalc: p.perCalc && typeof p.perCalc === "object" && !Array.isArray(p.perCalc) ? p.perCalc : {},
-    });
+    res.json({ ...faqDocFor(p, versionId), version_id: versionId });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 }
 
-// PUT /v3/post-instance-faq/:retemplateId — body { common?, perCalc? } (merges).
+// PUT /v3/post-instance-faq/:retemplateId — body { common?, perCalc?, version_id? }
+// (?version= also accepted). Writes THIS version's FAQ; other versions untouched.
+// Defaults to the published version.
 export async function savePostInstanceFaq(req, res) {
   const sql = getSql();
   const b = req.body || {};
   try {
     await ensurePiwFaqTable(sql);
     const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, b.version_id || req.query.version);
+    if (!versionId) return res.status(400).json({ error: "Template has no version to attach the FAQ to" });
     const [row] = await sql.unsafe(`SELECT payload FROM ${T.piw_faq} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
     const cur = row ? parseJsonbStr(row.payload, {}) : {};
-    const next = {
-      common: Array.isArray(b.common) ? b.common : (Array.isArray(cur.common) ? cur.common : null),
-      perCalc: {
-        ...(cur.perCalc && typeof cur.perCalc === "object" ? cur.perCalc : {}),
-        ...(b.perCalc && typeof b.perCalc === "object" ? b.perCalc : {}),
-      },
+    const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+    const doc = {
+      common: Array.isArray(b.common) ? b.common : [],
+      perCalc: b.perCalc && typeof b.perCalc === "object" && !Array.isArray(b.perCalc) ? b.perCalc : {},
+      sections: Array.isArray(b.sections) ? b.sections : [],
     };
+    const next = { ...cur, versions: { ...byVer, [versionId]: doc } };
     await sql.unsafe(
       `INSERT INTO ${T.piw_faq} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
        ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
       [rid, JSON.stringify(next)],
     );
-    res.json({ ok: true, ...next });
+    res.json({ ok: true, version_id: versionId, ...doc });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// ── Test Sets (retemplate editor "Testing" tab) ──────────────────────────────
+// One row per template, JSONB array payload:
+//   payload = [ { id, name, inputs: { <miKey>: <string value> } }, ... ]
+// A "test set" is a named snapshot of master-input overrides used to try
+// what-if scenarios in the editor. Applying a set is a purely in-memory
+// action in the FE — the DB just stores the sets themselves.
+async function ensureTestSetsTable(sql) {
+  await sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.test_sets} (template_id VARCHAR(24) PRIMARY KEY, payload JSONB NOT NULL DEFAULT '[]'::jsonb, updated_at TIMESTAMPTZ DEFAULT NOW())`)
+    .catch(() => {});
+}
+
+// GET /v3/test-sets/:templateId  →  { sets: [...] }
+export async function getTestSets(req, res) {
+  const sql = getSql();
+  try {
+    await ensureTestSetsTable(sql);
+    const tid = req.params.templateId;
+    if (!tid) return res.status(400).json({ error: "templateId required" });
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.test_sets} WHERE template_id = $1 LIMIT 1`, [tid]);
+    const p = row ? parseJsonbStr(row.payload, []) : [];
+    const sets = Array.isArray(p) ? p : [];
+    res.json({ sets });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/test-sets/:templateId — body { sets: [...] } — replaces the whole array.
+export async function saveTestSets(req, res) {
+  const sql = getSql();
+  try {
+    await ensureTestSetsTable(sql);
+    const tid = req.params.templateId;
+    if (!tid) return res.status(400).json({ error: "templateId required" });
+    const sets = Array.isArray(req.body?.sets) ? req.body.sets : [];
+    await sql.unsafe(
+      `INSERT INTO ${T.test_sets} (template_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (template_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+      [tid, JSON.stringify(sets)],
+    );
+    res.json({ ok: true, sets });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// ── Version-scoped report DASHBOARD ───────────────────────────────────────────
+// The report dashboard is authored in the retemplate editor and, like the FAQ,
+// is VERSION-SCOPED so that widget cell references (which can sit at different
+// addresses in different versions, and shift with row/column edits) stay correct
+// per version. Storage is one row per template (v3_dashboard, PK retemplate_id)
+// with the versioning inside the JSON payload:
+//   payload.versions[versionId] = { widgets: [ ... ] }
+async function ensureDashboardTable(sql) {
+  await sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.dashboard} (retemplate_id VARCHAR(24) PRIMARY KEY, payload JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ DEFAULT NOW())`)
+    .catch(() => {});
+}
+
+function dashboardDocFor(payload, versionId) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const byVer = p.versions && typeof p.versions === "object" && !Array.isArray(p.versions) ? p.versions : {};
+  // Legacy fallback: a top-level widgets[] (pre-versioning) shows until re-saved.
+  const legacy = { widgets: Array.isArray(p.widgets) ? p.widgets : null };
+  const doc = versionId && byVer[versionId] ? byVer[versionId] : legacy;
+  return { widgets: Array.isArray(doc.widgets) ? doc.widgets : [] };
+}
+
+// Copy a template's dashboard doc from one version to another on version fork so
+// the new version inherits the source's widgets + their per-version refs. Non-fatal.
+async function copyDashboardForVersion(sql, templateId, sourceVersionId, newVersionId) {
+  if (!templateId || !sourceVersionId || !newVersionId) return;
+  await ensureDashboardTable(sql);
+  const [row] = await sql.unsafe(`SELECT payload FROM ${T.dashboard} WHERE retemplate_id = $1 LIMIT 1`, [templateId]);
+  if (!row) return;
+  const cur = parseJsonbStr(row.payload, {});
+  const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+  const srcDoc = byVer[sourceVersionId] || (Array.isArray(cur.widgets) ? { widgets: cur.widgets } : null);
+  if (!srcDoc) return;
+  const next = { ...cur, versions: { ...byVer, [newVersionId]: srcDoc } };
+  await sql.unsafe(
+    `INSERT INTO ${T.dashboard} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+    [templateId, JSON.stringify(next)],
+  );
+}
+
+// GET /v3/dashboard/:retemplateId?version=<id>
+// Returns the dashboard for the given version (defaults to the published one).
+export async function getDashboard(req, res) {
+  const sql = getSql();
+  try {
+    await ensureDashboardTable(sql);
+    const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, req.query.version);
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.dashboard} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
+    const p = row ? parseJsonbStr(row.payload, {}) : {};
+    res.json({ ...dashboardDocFor(p, versionId), version_id: versionId });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/dashboard/:retemplateId — body { widgets?, version_id? } (?version= also
+// accepted). Writes THIS version's dashboard; other versions untouched. Defaults
+// to the published version.
+export async function saveDashboard(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    await ensureDashboardTable(sql);
+    const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, b.version_id || req.query.version);
+    if (!versionId) return res.status(400).json({ error: "Template has no version to attach the dashboard to" });
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.dashboard} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
+    const cur = row ? parseJsonbStr(row.payload, {}) : {};
+    const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+    const doc = { widgets: Array.isArray(b.widgets) ? b.widgets : [] };
+    const next = { ...cur, versions: { ...byVer, [versionId]: doc } };
+    await sql.unsafe(
+      `INSERT INTO ${T.dashboard} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+      [rid, JSON.stringify(next)],
+    );
+    res.json({ ok: true, version_id: versionId, ...doc });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// ── Sources ───────────────────────────────────────────────────────────────────
+// A "source" is a standalone, reusable reference document: a title + a markdown
+// body + a list of attached Drive files (+ tags). It is NOT tied to any template
+// or version — it's a global helper that can be attached / previewed anywhere in
+// the app. Storage is a plain CRUD table (v3_sources).
+// ── Instance comments ─────────────────────────────────────────────────────────
+// A flat discussion thread attached to a single instance (feasibility report).
+// The owner, collaborators, and admins all post here; each row records who
+// wrote it (user id + display name + role) so the UI can badge admin replies.
+async function ensureCommentsTable(sql) {
+  await sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.comments} (
+      id VARCHAR(24) PRIMARY KEY,
+      instance_id VARCHAR(24) NOT NULL,
+      user_id VARCHAR(24),
+      author_name TEXT,
+      author_role TEXT,
+      body TEXT NOT NULL DEFAULT '',
+      refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`)
+    .catch(() => {});
+  await sql
+    .unsafe(`CREATE INDEX IF NOT EXISTS idx_comments_instance ON ${T.comments}(instance_id)`)
+    .catch(() => {});
+  // Backfill for tables created before `refs` existed (cell / master-input pins).
+  await sql.unsafe(`ALTER TABLE ${T.comments} ADD COLUMN IF NOT EXISTS refs JSONB NOT NULL DEFAULT '[]'::jsonb`).catch(() => {});
+}
+
+const MAX_COMMENT = 10_000; // per-comment body cap
+
+// A comment may pin references to a cell (page + A1) or a master input (id +
+// label + its bound cell ref) so readers can jump straight to the spot.
+function normCommentRefsIn(refs) {
+  if (!Array.isArray(refs)) return [];
+  return refs
+    .slice(0, 20)
+    .map((r) => {
+      if (!r || typeof r !== "object") return null;
+      if (r.kind === "cell") {
+        const page = String(r.page || "").slice(0, 200);
+        const a1 = String(r.a1 || "").slice(0, 12);
+        return page && a1 ? { kind: "cell", page, a1 } : null;
+      }
+      if (r.kind === "mi") {
+        const miId = String(r.miId || "").slice(0, 24);
+        const label = String(r.label || "").slice(0, 200);
+        const ref = r.ref ? String(r.ref).slice(0, 200) : "";
+        return miId || label ? { kind: "mi", miId, label, ref } : null;
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+const normComment = (row) => (row ? { ...row, refs: parseJsonbStr(row.refs, []) } : row);
+
+// GET /v3/instances/:id/comments — oldest → newest.
+export async function listInstanceComments(req, res) {
+  const sql = getSql();
+  try {
+    await ensureCommentsTable(sql);
+    const rows = await sql.unsafe(
+      `SELECT * FROM ${T.comments} WHERE instance_id = $1 ORDER BY created_at ASC`,
+      [req.params.id],
+    );
+    res.json({ comments: rows.map(normComment) });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// POST /v3/instances/:id/comments — { body, user_id?, author_name?, author_role? }
+export async function createInstanceComment(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  const body = String(b.body || "").trim();
+  if (!body) return res.status(400).json({ error: "Comment body is required" });
+  try {
+    await ensureCommentsTable(sql);
+    const [row] = await sql.unsafe(
+      `INSERT INTO ${T.comments} (id, instance_id, user_id, author_name, author_role, body, refs)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) RETURNING *`,
+      [
+        newObjectId(),
+        req.params.id,
+        b.user_id ? String(b.user_id).slice(0, 24) : null,
+        b.author_name ? String(b.author_name).slice(0, 200) : null,
+        b.author_role ? String(b.author_role).slice(0, 40) : null,
+        body.slice(0, MAX_COMMENT),
+        JSON.stringify(normCommentRefsIn(b.refs)),
+      ],
+    );
+    broadcast({ type: "comment.created", instanceId: req.params.id, comment: normComment(row) });
+    res.status(201).json(normComment(row));
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// DELETE /v3/comments/:commentId — author or admin removes a comment.
+export async function deleteInstanceComment(req, res) {
+  const sql = getSql();
+  try {
+    await ensureCommentsTable(sql);
+    const [row] = await sql.unsafe(
+      `DELETE FROM ${T.comments} WHERE id = $1 RETURNING instance_id`,
+      [req.params.commentId],
+    );
+    if (!row) return res.status(404).json({ error: "Comment not found" });
+    broadcast({ type: "comment.deleted", instanceId: row.instance_id, commentId: req.params.commentId });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+async function ensureSourcesTable(sql) {
+  await sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.sources} (
+      id VARCHAR(24) PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT '',
+      slug TEXT,
+      body TEXT NOT NULL DEFAULT '',
+      format TEXT NOT NULL DEFAULT 'md',
+      files JSONB NOT NULL DEFAULT '[]'::jsonb,
+      tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`)
+    .catch(() => {});
+  // Backfill for tables created before `format` existed.
+  await sql.unsafe(`ALTER TABLE ${T.sources} ADD COLUMN IF NOT EXISTS format TEXT NOT NULL DEFAULT 'md'`).catch(() => {});
+}
+
+// A source body is authored as either markdown or (sanitised) HTML.
+const normFormat = (f) => (String(f || "").toLowerCase() === "html" ? "html" : "md");
+
+function slugify(s) {
+  return String(s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+function normSource(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    format: normFormat(row.format),
+    files: parseJsonbStr(row.files, []),
+    tags: parseJsonbStr(row.tags, []),
+  };
+}
+// Normalise attached files to a stable shape { fileId, name, mimeType, size },
+// tolerating either `fileId` or Drive's `id`. Drops entries without an id.
+function normFilesIn(files) {
+  if (!Array.isArray(files)) return [];
+  return files
+    .map((f) => (f && typeof f === "object" ? {
+      fileId: String(f.fileId || f.id || "").slice(0, 128),
+      name: String(f.name || "").slice(0, 512),
+      mimeType: String(f.mimeType || "").slice(0, 256),
+      size: Number(f.size) || 0,
+    } : null))
+    .filter((f) => f && f.fileId);
+}
+const MAX_BODY = 1_000_000; // 1MB cap on a source body
+
+// GET /v3/sources[?q=]  — list (light: excerpt instead of full body).
+export async function listSources(req, res) {
+  const sql = getSql();
+  try {
+    await ensureSourcesTable(sql);
+    const rows = await sql.unsafe(
+      `SELECT id, title, slug, format, LEFT(body, 240) AS excerpt, files, tags, created_at, updated_at
+         FROM ${T.sources} ORDER BY updated_at DESC`,
+    );
+    const q = String(req.query.q || "").trim().toLowerCase();
+    let list = rows.map(normSource);
+    if (q) {
+      list = list.filter((r) =>
+        `${r.title} ${r.slug || ""} ${(r.tags || []).join(" ")} ${r.excerpt || ""}`.toLowerCase().includes(q));
+    }
+    res.json({ sources: list });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/sources/:idOrSlug — full source (body included). Resolves by id, else slug.
+export async function getSource(req, res) {
+  const sql = getSql();
+  try {
+    await ensureSourcesTable(sql);
+    const key = req.params.id;
+    let [row] = await sql.unsafe(`SELECT * FROM ${T.sources} WHERE id = $1 LIMIT 1`, [key]);
+    if (!row) [row] = await sql.unsafe(`SELECT * FROM ${T.sources} WHERE slug = $1 ORDER BY updated_at DESC LIMIT 1`, [key]);
+    if (!row) return res.status(404).json({ error: "Source not found" });
+    res.json(normSource(row));
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// POST /v3/sources — { title, slug?, body?, files?, tags? }
+export async function createSource(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    await ensureSourcesTable(sql);
+    const id = newObjectId();
+    const title = String(b.title || "").trim() || "Untitled source";
+    const slug = (b.slug && slugify(b.slug)) || slugify(title) || id.slice(0, 8);
+    const [row] = await sql.unsafe(
+      `INSERT INTO ${T.sources} (id, title, slug, body, format, files, tags)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb) RETURNING *`,
+      [id, title, slug, String(b.body || "").slice(0, MAX_BODY), normFormat(b.format), JSON.stringify(normFilesIn(b.files)), JSON.stringify(Array.isArray(b.tags) ? b.tags : [])],
+    );
+    res.status(201).json(normSource(row));
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/sources/:id — partial update of any of { title, slug, body, files, tags }
+export async function updateSource(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    await ensureSourcesTable(sql);
+    const sets = [];
+    const vals = [];
+    let i = 1;
+    if (b.title !== undefined) { sets.push(`title = $${i++}`); vals.push(String(b.title || "")); }
+    if (b.slug !== undefined) { sets.push(`slug = $${i++}`); vals.push(slugify(b.slug)); }
+    if (b.body !== undefined) { sets.push(`body = $${i++}`); vals.push(String(b.body || "").slice(0, MAX_BODY)); }
+    if (b.format !== undefined) { sets.push(`format = $${i++}`); vals.push(normFormat(b.format)); }
+    if (b.files !== undefined) { sets.push(`files = $${i++}::jsonb`); vals.push(JSON.stringify(normFilesIn(b.files))); }
+    if (b.tags !== undefined) { sets.push(`tags = $${i++}::jsonb`); vals.push(JSON.stringify(Array.isArray(b.tags) ? b.tags : [])); }
+    if (!sets.length) return res.status(400).json({ error: "Nothing to update" });
+    sets.push(`updated_at = NOW()`);
+    vals.push(req.params.id);
+    const [row] = await sql.unsafe(`UPDATE ${T.sources} SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`, vals);
+    if (!row) return res.status(404).json({ error: "Source not found" });
+    res.json(normSource(row));
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// DELETE /v3/sources/:id
+export async function deleteSource(req, res) {
+  const sql = getSql();
+  try {
+    await ensureSourcesTable(sql);
+    await sql.unsafe(`DELETE FROM ${T.sources} WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
@@ -3511,11 +4938,34 @@ export async function saveDcprGraph(req, res) {
 }
 
 // GET /v3/calculations/:id — single
+// Lazily add calculation columns that ensureTables may not have created (its v3
+// migration can bail early on some DBs). Memoized ALTER ... IF NOT EXISTS, run
+// before calc reads/writes so the blog editor works regardless of boot state.
+let _calcColsEnsured = null;
+function ensureCalcColumns() {
+  if (_calcColsEnsured) return _calcColsEnsured;
+  const sql = getSql();
+  _calcColsEnsured = sql
+    .unsafe(`ALTER TABLE ${T.v3_calculations} ADD COLUMN IF NOT EXISTS blog_content TEXT`)
+    // blog_format: how blog_content should be rendered — 'md' or 'html'. Legacy
+    // rows (Quill HTML) are treated as 'html' at read time via a CASE fallback,
+    // so no data backfill is required.
+    .then(() => sql.unsafe(`ALTER TABLE ${T.v3_calculations} ADD COLUMN IF NOT EXISTS blog_format TEXT`))
+    .catch((e) => {
+      _calcColsEnsured = null;
+      throw e;
+    });
+  return _calcColsEnsured;
+}
+
 export async function getCalculation(req, res) {
   const sql = getSql();
   try {
+    await ensureCalcColumns();
     const [row] = await sql.unsafe(
-      `SELECT id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, hide_v3, applicable_land_titles, applicable_localities, min_plot_area, max_plot_area, created_at, updated_at
+      `SELECT id, name, description, sector, author, ord, disabled, template_id, instance_id, retemplate_id, prefill_master_inputs, hide_v3, applicable_land_titles, applicable_localities, min_plot_area, max_plot_area, blog_content,
+              COALESCE(blog_format, CASE WHEN blog_content IS NOT NULL AND btrim(blog_content) <> '' THEN 'html' ELSE 'md' END) AS blog_format,
+              created_at, updated_at
        FROM ${T.v3_calculations}
        WHERE id = $1
        LIMIT 1`,
@@ -3592,11 +5042,14 @@ export async function patchCalculation(req, res) {
   if (b.applicable_localities !== undefined) { fields.push(`applicable_localities = $${i++}::jsonb`); args.push(JSON.stringify(Array.isArray(b.applicable_localities) ? b.applicable_localities : [])); }
   if (b.min_plot_area !== undefined) { fields.push(`min_plot_area = $${i++}`); args.push(b.min_plot_area === null || b.min_plot_area === "" ? null : Number(b.min_plot_area)); }
   if (b.max_plot_area !== undefined) { fields.push(`max_plot_area = $${i++}`); args.push(b.max_plot_area === null || b.max_plot_area === "" ? null : Number(b.max_plot_area)); }
+  if (b.blog_content !== undefined) { fields.push(`blog_content = $${i++}`); args.push(b.blog_content == null ? null : String(b.blog_content)); }
+  if (b.blog_format !== undefined) { fields.push(`blog_format = $${i++}`); args.push(b.blog_format === "html" ? "html" : "md"); }
   if (b.prefill_master_inputs !== undefined) { fields.push(`prefill_master_inputs = $${i++}::jsonb`); args.push(JSON.stringify(Array.isArray(b.prefill_master_inputs) ? b.prefill_master_inputs : [])); }
   if (fields.length === 0) return res.status(400).json({ error: "no fields to update" });
   fields.push(`updated_at = NOW()`);
   args.push(req.params.id);
   try {
+    await ensureCalcColumns();
     const [row] = await sql.unsafe(
       `UPDATE ${T.v3_calculations} SET ${fields.join(", ")}
        WHERE id = $${i}
@@ -3638,3 +5091,368 @@ export async function reorderCalculations(req, res) {
 // Note: hard-delete was intentionally removed — calculations are
 // soft-disabled via PATCH { disabled: true }. Admin still sees them and
 // can flip the flag; landing-L hides disabled rows.
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Combined comparison reports (multi-instance)
+//
+// A report groups N standalone instances into one side-by-side comparison.
+// The instances stay fully independent — they each own their own master-input
+// overrides (v3_instance_master_input). The report is just an ORDERED set of
+// members (v3_report_instances). Reads compose every member's master inputs and
+// ALIGN them into rows so overlapping inputs (e.g. two instances that each have
+// a "Plot Area") sit on one row, one column per instance.
+//
+// Overlap handling — the crux:
+//   • Column identity is the instance id (globally unique) → column index `col`.
+//   • Writes always route by (col → instanceId, templateMiId): editing column A's
+//     "Plot Area" can never touch column B's, because instanceId disambiguates
+//     even though templateMiId / key / display_name collide across instances.
+//   • Rows align by the composite `section::key` — the same disambiguation the
+//     editor already uses (schemeVisibility.miInputComposite), since `key` alone
+//     repeats across sections. Keyless MIs fall back to `mi:<templateMiId>` so
+//     they never merge wrongly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// A combined report compares at most this many instances at once — enforced on
+// every write/compose path so a saved report can never exceed what preview shows.
+const MAX_REPORT_INSTANCES = 8;
+
+// Parse + normalize a list of instance ids: trim, drop blanks, de-duplicate
+// (preserving first-seen order). Used by every report entry point so preview and
+// the saved-report paths behave identically.
+function normalizeInstanceIds(raw) {
+  const arr = Array.isArray(raw)
+    ? raw
+    : String(raw || "").split(",");
+  return [...new Set(arr.map((s) => String(s || "").trim()).filter(Boolean))];
+}
+
+// Lazily ensure the report tables exist even on DBs where ensureTables bailed
+// early (mirrors ensureCalcColumns). Memoized so it runs at most once per boot.
+let _reportTablesEnsured = null;
+function ensureReportTables() {
+  if (_reportTablesEnsured) return _reportTablesEnsured;
+  const sql = getSql();
+  _reportTablesEnsured = sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.reports} (
+        id VARCHAR(24) PRIMARY KEY, name TEXT, user_id VARCHAR(24),
+        created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
+    .then(() => sql.unsafe(`CREATE TABLE IF NOT EXISTS ${T.report_instances} (
+        id VARCHAR(24) PRIMARY KEY, report_id VARCHAR(24) NOT NULL,
+        instance_id VARCHAR(24) NOT NULL, ord INTEGER NOT NULL DEFAULT 0, col_label TEXT,
+        UNIQUE (report_id, instance_id))`))
+    .catch((e) => { _reportTablesEnsured = null; throw e; });
+  return _reportTablesEnsured;
+}
+
+// The composed-MI SELECT shared by getInstance / getInstanceMasterInputs, reused
+// here so a report column resolves exactly what the single-instance viewer sees.
+const COMPOSE_MI_SELECT = `
+  SELECT tmi.id, tmi.id AS template_mi_id, tmi.template_id, tmi.version_id,
+         tmi.key, tmi.display_name, tmi.ref, tmi.type, tmi.options, tmi.section,
+         tmi.ord, tmi.kind, tmi.group_id,
+         COALESCE(imi.value, tmi.default_value, tmi.value) AS value
+    FROM ${T.master_input} tmi
+    LEFT JOIN ${T.instance_mi} imi
+      ON imi.instance_id = $1
+      AND ( imi.template_mi_key = tmi.key
+            OR (imi.template_mi_key IS NULL AND imi.template_mi_id = tmi.id) )
+   WHERE tmi.template_id = $2 AND ($3::text IS NULL OR tmi.version_id = $3)
+   ORDER BY tmi.ord ASC`;
+
+// Re-apply the owning calculation's scheme prefill onto composed MIs, matched by
+// key — same behaviour as getInstance so the "Schemes" multiselect (and any other
+// prefilled input) shows its scheme value in the comparison, not the bare default.
+async function applyCalcPrefill(sql, inst, mis) {
+  try {
+    let calc = null;
+    if (inst.calculation_id) {
+      [calc] = await sql.unsafe(
+        `SELECT prefill_master_inputs FROM ${T.v3_calculations} WHERE id = $1 LIMIT 1`,
+        [inst.calculation_id],
+      );
+    }
+    if (!calc) {
+      const cands = await sql.unsafe(
+        `SELECT name, prefill_master_inputs FROM ${T.v3_calculations} WHERE retemplate_id = $1`,
+        [inst.template_id],
+      );
+      const nm = String(inst.name || "");
+      let best = null;
+      for (const c of cands || []) {
+        const cn = String(c.name || "");
+        if (cn && (nm === cn || nm.startsWith(cn + " — "))) {
+          if (!best || cn.length > String(best.name || "").length) best = c;
+        }
+      }
+      calc = best;
+    }
+    if (calc && calc.prefill_master_inputs != null) {
+      const raw = calc.prefill_master_inputs;
+      const arr = Array.isArray(raw) ? raw : JSON.parse(String(raw) || "[]");
+      const byKey = new Map();
+      for (const p of Array.isArray(arr) ? arr : []) {
+        if (p && p.key) byKey.set(String(p.key), p.value == null ? null : String(p.value));
+      }
+      if (byKey.size) for (const mi of mis) if (byKey.has(mi.key)) mi.value = byKey.get(mi.key);
+    }
+  } catch (e) {
+    console.error("[report] calc prefill resolve failed:", e.message);
+  }
+}
+
+// Load ONE instance as a report column: its composed master inputs (values +
+// metadata), plus light instance/template identity. Returns null if not found.
+async function composeInstanceColumn(sql, instanceId) {
+  const [inst] = await sql.unsafe(
+    `SELECT * FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`, [instanceId],
+  );
+  if (!inst) return null;
+  const [tpl] = await sql.unsafe(
+    `SELECT id, name, scheme, published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+    [inst.template_id],
+  );
+  const versionId = tpl?.published_version_id || inst.version_id || null;
+  const mis = await sql.unsafe(COMPOSE_MI_SELECT, [instanceId, inst.template_id, versionId]);
+  await applyCalcPrefill(sql, inst, mis);
+  return {
+    instanceId: inst.id,
+    name: inst.name || null,
+    calculation_id: inst.calculation_id || null,
+    template: tpl ? { id: tpl.id, name: tpl.name, scheme: tpl.scheme } : null,
+    masterInputs: mis.map(normalizeMasterInput),
+  };
+}
+
+// Fold N composed columns into aligned rows grouped by section. Each row collects
+// one cell per column that has this input; `overlap` marks rows shared by >1 column
+// (the actual comparison rows). Storage/routing identity is per-cell
+// (templateMiId + owning column) — never the shared key.
+function reportAlignment(columns) {
+  const rowByComposite = new Map();
+  const rowOrder = [];
+  const sectionOrder = [];
+  const seenSection = new Set();
+
+  columns.forEach((column, ci) => {
+    const col = String(ci);
+    for (const mi of column.masterInputs || []) {
+      const section = mi.section || "";
+      const key = mi.key || "";
+      const base = key ? `${section}::${key}` : `mi:${mi.id}`;
+      if (!seenSection.has(section)) { seenSection.add(section); sectionOrder.push(section); }
+      // If this column already filled the base composite, this is a genuine
+      // duplicate (same section+key authored twice in one template — `key` is not
+      // unique). Split it into its own row (base#miId) so BOTH values stay
+      // visible instead of the second silently overwriting the first.
+      let composite = base;
+      let row = rowByComposite.get(composite);
+      if (row && row.cells[col]) {
+        composite = `${base}#${mi.id}`;
+        row = rowByComposite.get(composite);
+      }
+      if (!row) {
+        row = {
+          composite, section, key,
+          display_name: mi.display_name || key || mi.id,
+          type: mi.type || "text",
+          options: Array.isArray(mi.options) ? mi.options : [],
+          ord: mi.ord ?? 0,
+          cells: {},
+        };
+        rowByComposite.set(composite, row);
+        rowOrder.push(row);
+      } else {
+        if (!row.display_name && (mi.display_name || key)) row.display_name = mi.display_name || key;
+        if ((!row.options || !row.options.length) && Array.isArray(mi.options) && mi.options.length) row.options = mi.options;
+        if (mi.type && row.type === "text") row.type = mi.type;
+        row.ord = Math.min(row.ord, mi.ord ?? 0);
+      }
+      // Type + options live PER CELL: the "same" input across two templates can
+      // legitimately be a select in one and text in another, so each column's
+      // editor must reflect its own instance's MI, not a row-shared guess.
+      row.cells[col] = {
+        templateMiId: mi.id,
+        value: mi.value == null ? "" : mi.value,
+        kind: mi.kind || "basic",
+        ref: mi.ref || null,
+        type: mi.type || "text",
+        options: Array.isArray(mi.options) ? mi.options : [],
+      };
+    }
+  });
+
+  const sections = sectionOrder.map((section) => {
+    const rows = rowOrder.filter((r) => r.section === section);
+    rows.sort((a, b) => a.ord - b.ord);
+    rows.forEach((r) => { r.overlap = Object.keys(r.cells).length > 1; });
+    return { section, rows };
+  });
+  const stats = {
+    columns: columns.length,
+    totalRows: rowOrder.length,
+    overlapRows: rowOrder.filter((r) => Object.keys(r.cells).length > 1).length,
+  };
+  return { sections, stats };
+}
+
+// Shared: compose an ordered list of instance ids into { columns, alignment }.
+async function buildReportView(sql, instanceIds) {
+  const columns = [];
+  for (let i = 0; i < instanceIds.length; i++) {
+    const c = await composeInstanceColumn(sql, instanceIds[i]);
+    columns.push(c
+      ? { col: i, ...c }
+      : { col: i, instanceId: instanceIds[i], name: null, template: null, masterInputs: [], missing: true });
+  }
+  const alignment = reportAlignment(columns);
+  // Strip the heavy per-column masterInputs from the response — every value is
+  // already folded into alignment.cells; columns keep only identity + a count.
+  const lightColumns = columns.map(({ masterInputs, ...c }) => ({ ...c, miCount: (masterInputs || []).length }));
+  return { columns: lightColumns, alignment };
+}
+
+async function replaceReportInstances(sql, reportId, instanceIds) {
+  await sql.unsafe(`DELETE FROM ${T.report_instances} WHERE report_id = $1`, [reportId]);
+  const seen = new Set();
+  let ord = 0;
+  for (const raw of instanceIds || []) {
+    const iid = String(raw || "").trim();
+    if (!iid || seen.has(iid)) continue;
+    seen.add(iid);
+    await sql.unsafe(
+      `INSERT INTO ${T.report_instances} (id, report_id, instance_id, ord) VALUES ($1,$2,$3,$4)`,
+      [newObjectId(), reportId, iid, ord++],
+    );
+  }
+}
+
+async function reportInstanceIds(sql, reportId) {
+  const rows = await sql.unsafe(
+    `SELECT instance_id FROM ${T.report_instances} WHERE report_id = $1 ORDER BY ord ASC`,
+    [reportId],
+  );
+  return rows.map((r) => r.instance_id);
+}
+
+// GET /v3/reports/preview?ids=a,b,c — ad-hoc comparison of instance ids, no save.
+export async function previewReport(req, res) {
+  const sql = getSql();
+  try {
+    const ids = normalizeInstanceIds(req.query.ids);
+    if (!ids.length) return res.status(400).json({ error: "ids query param required (comma-separated instance ids)" });
+    if (ids.length > MAX_REPORT_INSTANCES) return res.status(400).json({ error: `at most ${MAX_REPORT_INSTANCES} instances can be compared at once` });
+    res.json(await buildReportView(sql, ids));
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/reports?user_id= — list saved reports (+ member count).
+export async function listReports(req, res) {
+  const sql = getSql();
+  try {
+    await ensureReportTables();
+    const uid = req.query.user_id ? String(req.query.user_id) : null;
+    const rows = await sql.unsafe(
+      `SELECT r.*,
+              (SELECT COUNT(*) FROM ${T.report_instances} ri WHERE ri.report_id = r.id) AS instance_count,
+              (SELECT COALESCE(array_agg(ri.instance_id ORDER BY ri.ord), '{}')
+                 FROM ${T.report_instances} ri WHERE ri.report_id = r.id) AS instance_ids,
+              EXISTS (
+                SELECT 1 FROM ${T.report_instances} ri
+                  JOIN ${T.v3_instances} i ON i.id = ri.instance_id
+                 WHERE ri.report_id = r.id
+                   AND i.user_id IS DISTINCT FROM r.user_id
+              ) AS is_shared
+         FROM ${T.reports} r
+        WHERE ($1::text IS NULL OR r.user_id = $1)
+        ORDER BY r.updated_at DESC
+        LIMIT 500`,
+      [uid],
+    );
+    res.json({ reports: rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// POST /v3/reports — { name?, user_id?, instance_ids: [] }
+export async function createReport(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  const instanceIds = normalizeInstanceIds(b.instance_ids);
+  if (instanceIds.length > MAX_REPORT_INSTANCES) {
+    return res.status(400).json({ error: `a report can hold at most ${MAX_REPORT_INSTANCES} instances` });
+  }
+  try {
+    await ensureReportTables();
+    const id = newObjectId();
+    await sql.unsafe(
+      `INSERT INTO ${T.reports} (id, name, user_id) VALUES ($1,$2,$3)`,
+      [id, b.name ? String(b.name) : null, b.user_id ? String(b.user_id) : (requesterId(req) || null)],
+    );
+    await replaceReportInstances(sql, id, instanceIds);
+    const [row] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [id]);
+    res.status(201).json({ ...row, instance_ids: instanceIds });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/reports/:id — the saved report + composed { columns, alignment }.
+export async function getReport(req, res) {
+  const sql = getSql();
+  try {
+    await ensureReportTables();
+    const [row] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [req.params.id]);
+    if (!row) return res.status(404).json({ error: "Report not found" });
+    const ids = await reportInstanceIds(sql, req.params.id);
+    const view = await buildReportView(sql, ids);
+    res.json({ report: { ...row, instance_ids: ids }, ...view });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PATCH /v3/reports/:id — { name?, instance_ids? }
+export async function patchReport(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    await ensureReportTables();
+    const [row] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [req.params.id]);
+    if (!row) return res.status(404).json({ error: "Report not found" });
+    if (b.name !== undefined) {
+      await sql.unsafe(`UPDATE ${T.reports} SET name = $1, updated_at = NOW() WHERE id = $2`,
+        [b.name == null ? null : String(b.name), req.params.id]);
+    }
+    if (Array.isArray(b.instance_ids)) {
+      const ids = normalizeInstanceIds(b.instance_ids);
+      if (ids.length > MAX_REPORT_INSTANCES) {
+        return res.status(400).json({ error: `a report can hold at most ${MAX_REPORT_INSTANCES} instances` });
+      }
+      await replaceReportInstances(sql, req.params.id, ids);
+      await sql.unsafe(`UPDATE ${T.reports} SET updated_at = NOW() WHERE id = $1`, [req.params.id]);
+    }
+    const [fresh] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [req.params.id]);
+    const ids = await reportInstanceIds(sql, req.params.id);
+    res.json({ ...fresh, instance_ids: ids });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// DELETE /v3/reports/:id — drops the report + its links (never the instances).
+export async function deleteReport(req, res) {
+  const sql = getSql();
+  try {
+    await ensureReportTables();
+    await sql.unsafe(`DELETE FROM ${T.report_instances} WHERE report_id = $1`, [req.params.id]);
+    const [row] = await sql.unsafe(`DELETE FROM ${T.reports} WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!row) return res.status(404).json({ error: "Report not found" });
+    res.status(204).end();
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
