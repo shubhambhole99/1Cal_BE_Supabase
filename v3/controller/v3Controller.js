@@ -2621,7 +2621,9 @@ export async function promoteToPublished(req, res) {
   if (sourceVersionId === targetVersionId) {
     return res.status(400).json({ error: "Source and target are the same version" });
   }
-  if (pageNames.length === 0 && mis.length === 0 && sectionNames.length === 0) {
+  // deleteMissing (Push to Publish) is meaningful on its own: the draft may
+  // have nothing left to copy and still need deletions mirrored.
+  if (pageNames.length === 0 && mis.length === 0 && sectionNames.length === 0 && !b.deleteMissing) {
     return res.status(400).json({ error: "Nothing to promote: provide pages, masterInputs and/or sections" });
   }
 
@@ -2638,9 +2640,9 @@ export async function promoteToPublished(req, res) {
     if (!tgt) return res.status(404).json({ error: "Target version not found" });
 
     const out = {
-      pages: { updated: [], created: [], missing: [] },
-      masterInputs: { updated: [], missing: [] },
-      sections: { promoted: [], empty: [] },
+      pages: { updated: [], created: [], missing: [], deleted: [] },
+      masterInputs: { updated: [], missing: [], deleted: [] },
+      sections: { promoted: [], empty: [], deleted: [] },
     };
 
     // ── Pages (match by name) ───────────────────────────────────────────────
@@ -2817,6 +2819,86 @@ export async function promoteToPublished(req, res) {
       broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId, section });
     }
 
+    // ── Mirror deletions (Push to Publish only) ─────────────────────────────
+    // The loops above only ever update or create, so anything DELETED in the
+    // draft used to live on forever in the published version. `deleteMissing`
+    // makes the target mirror the source: whatever the source no longer has is
+    // removed from the target too. Opt-in, so a selective one-page promote can
+    // never delete anything. Safe because Push to Publish snapshots the current
+    // published content into an "ex-published" version first.
+    if (b.deleteMissing) {
+      // Pages present in the target but gone from the source.
+      const stalePages = await sql.unsafe(
+        `SELECT t.id, t.name FROM ${T.v3_pages} t
+          WHERE t.template_id = $1 AND t.version_id = $2
+            AND NOT EXISTS (
+              SELECT 1 FROM ${T.v3_pages} s
+               WHERE s.template_id = $1 AND s.version_id = $3 AND s.name = t.name)`,
+        [templateId, targetVersionId, sourceVersionId],
+      );
+      for (const p of stalePages) {
+        await sql.unsafe(`DELETE FROM ${T.v3_pages} WHERE id = $1`, [p.id]);
+        // Same dangling-link cleanup deletePage does: drop the import link once
+        // no IMPORTED copy of that name survives in any version.
+        try {
+          const remaining = await sql.unsafe(
+            `SELECT 1 FROM ${T.v3_pages} WHERE template_id = $1 AND name = $2 AND is_imported = TRUE LIMIT 1`,
+            [templateId, p.name],
+          );
+          if (!remaining.length) {
+            await ensureImportTable(sql);
+            await sql.unsafe(
+              `DELETE FROM ${T.v3_page_imports} WHERE template_id = $1 AND page_name = $2`,
+              [templateId, p.name],
+            );
+          }
+        } catch (e) { console.error("[promoteToPublished] import-link cleanup failed:", e?.message || e); }
+        out.pages.deleted.push(p.name);
+        broadcast({ type: "page.deleted", templateId, versionId: targetVersionId, pageId: p.id, pageName: p.name });
+      }
+
+      // Whole sections the source no longer has (inputs first, then groups —
+      // FK order). Sections the source still has were already wiped+rewritten
+      // by the section loop above.
+      const staleSections = await sql.unsafe(
+        `SELECT DISTINCT section FROM ${T.master_input}
+          WHERE template_id = $1 AND version_id = $2 AND section IS NOT NULL AND section <> ''
+            AND section NOT IN (
+              SELECT DISTINCT section FROM ${T.master_input}
+               WHERE template_id = $1 AND version_id = $3 AND section IS NOT NULL AND section <> '')`,
+        [templateId, targetVersionId, sourceVersionId],
+      );
+      for (const { section } of staleSections) {
+        await sql.begin(async (tx) => {
+          await tx.unsafe(
+            `DELETE FROM ${T.master_input} WHERE template_id=$1 AND version_id=$2 AND COALESCE(section,'')=COALESCE($3,'')`,
+            [templateId, targetVersionId, section],
+          );
+          await tx.unsafe(
+            `DELETE FROM ${T.master_input_group} WHERE template_id=$1 AND version_id=$2 AND COALESCE(section,'')=COALESCE($3,'')`,
+            [templateId, targetVersionId, section],
+          );
+        });
+        out.sections.deleted.push(section);
+        broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId, section });
+      }
+
+      // Loose (no-section) inputs the source no longer has. The MI loop only
+      // ever UPDATEs existing rows, so these would otherwise never go away.
+      const staleLoose = await sql.unsafe(
+        `DELETE FROM ${T.master_input} t
+          WHERE t.template_id = $1 AND t.version_id = $2 AND COALESCE(t.section,'') = ''
+            AND NOT EXISTS (
+              SELECT 1 FROM ${T.master_input} s
+               WHERE s.template_id = $1 AND s.version_id = $3
+                 AND COALESCE(s.section,'') = '' AND s.key = t.key)
+          RETURNING t.key`,
+        [templateId, targetVersionId, sourceVersionId],
+      );
+      for (const r of staleLoose) out.masterInputs.deleted.push(r.key);
+      if (staleLoose.length) broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId });
+    }
+
     res.json({ ok: true, ...out });
   } catch (e) {
     console.error("[promoteToPublished] error:", e?.message || e);
@@ -2876,7 +2958,17 @@ export async function pushToPublished(req, res) {
   ).map((r) => ({ key: r.key, section: r.section ?? null }));
 
   if (pages.length === 0 && sections.length === 0 && masterInputs.length === 0) {
-    return res.status(400).json({ error: "Nothing to push — the source version is empty" });
+    // An empty source is only a no-op if the published version is empty too;
+    // otherwise this is a "the draft deleted everything" push and the deletions
+    // still have to be mirrored.
+    const [{ count: tgtCount }] = await sql.unsafe(
+      `SELECT (
+         (SELECT COUNT(*) FROM ${T.v3_pages} WHERE template_id=$1 AND version_id=$2) +
+         (SELECT COUNT(*) FROM ${T.master_input} WHERE template_id=$1 AND version_id=$2)
+       )::int AS count`,
+      [templateId, targetVersionId],
+    );
+    if (!tgtCount) return res.status(400).json({ error: "Nothing to push — the source version is empty" });
   }
 
   // Snapshot the CURRENT published version before Push overwrites its content,
@@ -2923,7 +3015,11 @@ export async function pushToPublished(req, res) {
   catch (e) { console.error("[pushToPublished] workflow copy failed:", e?.message || e); }
 
   // Delegate to the existing, tested promote path with the full lists.
-  req.body = { sourceVersionId, targetVersionId, pages, sections, masterInputs };
+  // deleteMissing makes the published version MIRROR the source: pages,
+  // sections and loose inputs deleted in the draft are removed from published
+  // instead of lingering there forever. The ex-published snapshot taken above
+  // still holds the pre-push content.
+  req.body = { sourceVersionId, targetVersionId, pages, sections, masterInputs, deleteMissing: true };
   return promoteToPublished(req, res);
 }
 
