@@ -2732,6 +2732,44 @@ export async function promoteToPublished(req, res) {
         out.masterInputs.updated.push(key);
         const r = updated[0];
         broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId, masterInputId: r.id, key: r.key, ref: r.ref, value: r.value });
+      } else if (b.deleteMissing) {
+        // Mirror mode (Push to Publish): a loose input that's new in the draft
+        // has to be CREATED, not just reported missing, or published can never
+        // be an exact replica of the version being pushed.
+        const created = await sql.unsafe(
+          `INSERT INTO ${T.master_input}
+             (id, template_id, version_id, key, value, ref, type, options,
+              section, ord, display_name, kind, group_id, default_value)
+           SELECT substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
+             m.template_id, $2::text, m.key, m.value, m.ref, m.type,
+             CASE
+               WHEN m.options IS NULL OR jsonb_typeof(m.options) <> 'array' THEN m.options
+               ELSE (
+                 SELECT jsonb_agg(
+                   CASE WHEN jsonb_typeof(opt) = 'object' AND opt ? 'pages' THEN
+                     jsonb_set(opt, '{pages}', COALESCE(
+                       (SELECT jsonb_agg(tp.id)
+                        FROM jsonb_array_elements_text(opt->'pages') AS pid
+                        JOIN ${T.v3_pages} sp ON sp.id = pid AND sp.template_id = $1 AND sp.version_id = $3
+                        JOIN ${T.v3_pages} tp ON tp.name = sp.name AND tp.template_id = $1 AND tp.version_id = $2),
+                       '[]'::jsonb))
+                   ELSE opt END)
+                 FROM jsonb_array_elements(m.options) AS opt)
+             END,
+             m.section, m.ord, m.display_name, m.kind, NULL, m.default_value
+           FROM ${T.master_input} m
+           WHERE m.template_id = $1 AND m.version_id = $3 AND m.key = $4
+             AND COALESCE(m.section,'') = COALESCE($5,'')
+           RETURNING id, key`,
+          [templateId, targetVersionId, sourceVersionId, key, section],
+        );
+        if (created.length) {
+          out.masterInputs.created = out.masterInputs.created || [];
+          out.masterInputs.created.push(key);
+          broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId, masterInputId: created[0].id, key });
+        } else {
+          out.masterInputs.missing.push(key);
+        }
       } else {
         out.masterInputs.missing.push(key);
       }
@@ -2897,6 +2935,66 @@ export async function promoteToPublished(req, res) {
       );
       for (const r of staleLoose) out.masterInputs.deleted.push(r.key);
       if (staleLoose.length) broadcast({ type: "masterInput.updated", templateId, versionId: targetVersionId });
+
+      // Page ORDER. The page loop deliberately keeps the target's own ord, so a
+      // reorder in the draft would never reach published — the tabs would read
+      // in the old order even though every page matched. Mirror it by name.
+      // Two phases: (ord, template, version) is UNIQUE, so assigning the final
+      // ords in one statement collides on any swap (A:0->1 while B is still 1).
+      // Park every row in a high range first, then bring them down.
+      const OFFSET = 1000000;
+      const reordered = await sql.begin(async (tx) => {
+        await tx.unsafe(
+          `UPDATE ${T.v3_pages} SET ord = ord + $3 WHERE template_id = $1 AND version_id = $2`,
+          [templateId, targetVersionId, OFFSET],
+        );
+        const moved = await tx.unsafe(
+          `UPDATE ${T.v3_pages} t SET ord = s.ord
+             FROM ${T.v3_pages} s
+            WHERE t.template_id = $1 AND t.version_id = $2
+              AND s.template_id = $1 AND s.version_id = $3
+              AND s.name = t.name
+            RETURNING t.name, t.ord`,
+          [templateId, targetVersionId, sourceVersionId],
+        );
+        // Anything with no counterpart in the source keeps its parked ord —
+        // pack those after the last real page instead of leaving a 1000000 gap.
+        const leftovers = await tx.unsafe(
+          `SELECT id FROM ${T.v3_pages}
+            WHERE template_id = $1 AND version_id = $2 AND ord >= $3 ORDER BY ord ASC`,
+          [templateId, targetVersionId, OFFSET],
+        );
+        if (leftovers.length) {
+          const [{ max_ord }] = await tx.unsafe(
+            `SELECT COALESCE(MAX(ord), -1) AS max_ord FROM ${T.v3_pages}
+              WHERE template_id = $1 AND version_id = $2 AND ord < $3`,
+            [templateId, targetVersionId, OFFSET],
+          );
+          let next = (max_ord ?? -1) + 1;
+          for (const l of leftovers) {
+            await tx.unsafe(`UPDATE ${T.v3_pages} SET ord = $2 WHERE id = $1`, [l.id, next++]);
+          }
+        }
+        return moved;
+      });
+      if (reordered.length) {
+        out.pages.reordered = reordered.map((r) => r.name);
+        broadcast({ type: "page.updated", templateId, versionId: targetVersionId });
+      }
+
+      // Version-scoped page groups (the sidebar folders). Without this the
+      // published version keeps its old grouping after a push.
+      try {
+        await sql.unsafe(
+          `UPDATE ${T.v3_versions} t
+              SET page_groups = (SELECT s.page_groups FROM ${T.v3_versions} s WHERE s.id = $2)
+            WHERE t.id = $1`,
+          [targetVersionId, sourceVersionId],
+        );
+        out.pageGroupsSynced = true;
+      } catch (e) {
+        console.error("[promoteToPublished] page_groups sync failed:", e?.message || e);
+      }
     }
 
     res.json({ ok: true, ...out });
