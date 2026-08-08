@@ -3341,24 +3341,56 @@ export async function createInstance(req, res) {
     (b.name && String(b.name).trim()) ||
     `${tpl.name || "Untitled"} — instance ${new Date().toISOString().slice(0, 10)}`;
 
+  // Every report lives inside a project. The caller may name an existing one via
+  // `report_id`; otherwise the report gets its own project here, server-side, so
+  // no client (FE, admin page or MCP) can create an orphan.
+  let reportId = b.report_id ? String(b.report_id) : null;
   try {
+    await ensureReportTables();
     // Remember which calculation this instance was created from, so its scheme
     // can be re-resolved on every open (see getInstance). Idempotent column add
     // works even when ENSURE_TABLES=false.
     await sql.unsafe(`ALTER TABLE ${T.v3_instances} ADD COLUMN IF NOT EXISTS calculation_id VARCHAR(24)`).catch(() => {});
     const calculationId = b.calculation_id ? String(b.calculation_id) : null;
-    await sql.unsafe(
-      `INSERT INTO ${T.v3_instances}
-         (id, template_id, version_id, name, user_id, calculation_id)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [instanceId, b.template_id, versionId, instanceName, String(ownerId), calculationId],
-    );
+    // One transaction: instance + project + link land together, so a failure
+    // can never leave a half-created report outside a project.
+    await sql.begin(async (tx) => {
+      await tx.unsafe(
+        `INSERT INTO ${T.v3_instances}
+           (id, template_id, version_id, name, user_id, calculation_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [instanceId, b.template_id, versionId, instanceName, String(ownerId), calculationId],
+      );
+      if (reportId) {
+        const [existing] = await tx.unsafe(`SELECT id FROM ${T.reports} WHERE id = $1 LIMIT 1`, [reportId]);
+        if (!existing) reportId = null; // stale id — fall through and make a fresh project
+      }
+      if (!reportId) {
+        reportId = newObjectId();
+        await tx.unsafe(
+          `INSERT INTO ${T.reports} (id, name, user_id, collaborators) VALUES ($1,$2,$3,'[]'::jsonb)`,
+          [reportId, instanceName, String(ownerId)],
+        );
+      }
+      const [{ next_ord: nextOrd }] = await tx.unsafe(
+        `SELECT COALESCE(MAX(ord) + 1, 0) AS next_ord FROM ${T.report_instances} WHERE report_id = $1`,
+        [reportId],
+      );
+      await tx.unsafe(
+        `INSERT INTO ${T.report_instances} (id, report_id, instance_id, ord)
+         VALUES ($1,$2,$3,$4) ON CONFLICT (report_id, instance_id) DO NOTHING`,
+        [newObjectId(), reportId, instanceId, nextOrd],
+      );
+      await tx.unsafe(`UPDATE ${T.reports} SET updated_at = NOW() WHERE id = $1`, [reportId]);
+    });
   } catch (e) {
     return res.status(500).json({ error: `Create instance failed: ${e.message}` });
   }
 
   const [row] = await sql.unsafe(`SELECT * FROM ${T.v3_instances} WHERE id = $1`, [instanceId]);
-  res.status(201).json(row);
+  // `report_id` lets the caller redirect straight to /instance/<id>?report=<pid>
+  // instead of emitting a bare link the workspace would have to re-resolve.
+  res.status(201).json({ ...row, report_id: reportId });
 }
 
 // GET /v3/instances/:id
@@ -3623,8 +3655,39 @@ export async function copyInstance(req, res) {
     return res.status(500).json({ error: `Copy instance failed: ${e.message}` });
   }
 
+  // Same invariant as createInstance: a copy is a report, so it must land in a
+  // project — the caller's (`report_id`) or a fresh one named after the copy.
+  let copyReportId = req.body?.report_id ? String(req.body.report_id) : null;
+  try {
+    await ensureReportTables();
+    if (copyReportId) {
+      const [existing] = await sql.unsafe(`SELECT id FROM ${T.reports} WHERE id = $1 LIMIT 1`, [copyReportId]);
+      if (!existing) copyReportId = null;
+    }
+    if (!copyReportId) {
+      copyReportId = newObjectId();
+      await sql.unsafe(
+        `INSERT INTO ${T.reports} (id, name, user_id, collaborators) VALUES ($1,$2,$3,'[]'::jsonb)`,
+        [copyReportId, newName, String(requester)],
+      );
+    }
+    const [{ next_ord: nextOrd }] = await sql.unsafe(
+      `SELECT COALESCE(MAX(ord) + 1, 0) AS next_ord FROM ${T.report_instances} WHERE report_id = $1`,
+      [copyReportId],
+    );
+    await sql.unsafe(
+      `INSERT INTO ${T.report_instances} (id, report_id, instance_id, ord)
+       VALUES ($1,$2,$3,$4) ON CONFLICT (report_id, instance_id) DO NOTHING`,
+      [newObjectId(), copyReportId, newId, nextOrd],
+    );
+  } catch (e) {
+    // The copy itself succeeded — don't fail the request over its project.
+    console.error("copyInstance: could not attach project:", e.message);
+    copyReportId = null;
+  }
+
   const [row] = await sql.unsafe(`SELECT * FROM ${T.v3_instances} WHERE id = $1`, [newId]);
-  res.status(201).json(row);
+  res.status(201).json({ ...row, report_id: copyReportId });
 }
 
 // DELETE /v3/instances/:id
@@ -5136,7 +5199,12 @@ function ensureReportTables() {
   _reportTablesEnsured = sql
     .unsafe(`CREATE TABLE IF NOT EXISTS ${T.reports} (
         id VARCHAR(24) PRIMARY KEY, name TEXT, user_id VARCHAR(24),
+        collaborators JSONB DEFAULT '[]'::jsonb,
         created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
+    // Existing deployments predate the column — this path runs when
+    // ENSURE_TABLES=false, so it has to self-migrate too or project sharing
+    // silently 500s on boxes that never run ensureTables().
+    .then(() => sql.unsafe(`ALTER TABLE ${T.reports} ADD COLUMN IF NOT EXISTS collaborators JSONB DEFAULT '[]'::jsonb`))
     .then(() => sql.unsafe(`CREATE TABLE IF NOT EXISTS ${T.report_instances} (
         id VARCHAR(24) PRIMARY KEY, report_id VARCHAR(24) NOT NULL,
         instance_id VARCHAR(24) NOT NULL, ord INTEGER NOT NULL DEFAULT 0, col_label TEXT,
@@ -5313,6 +5381,10 @@ async function buildReportView(sql, instanceIds) {
 }
 
 async function replaceReportInstances(sql, reportId, instanceIds) {
+  // Remember who was in here before the rewrite so anything dropped can be
+  // re-homed instead of silently becoming an orphan report.
+  const previous = await sql.unsafe(
+    `SELECT instance_id FROM ${T.report_instances} WHERE report_id = $1`, [reportId]);
   await sql.unsafe(`DELETE FROM ${T.report_instances} WHERE report_id = $1`, [reportId]);
   const seen = new Set();
   let ord = 0;
@@ -5325,6 +5397,8 @@ async function replaceReportInstances(sql, reportId, instanceIds) {
       [newObjectId(), reportId, iid, ord++],
     );
   }
+  const dropped = previous.map((r) => r.instance_id).filter((iid) => !seen.has(iid));
+  if (dropped.length) await ensureInstancesHomed(sql, dropped);
 }
 
 async function reportInstanceIds(sql, reportId) {
@@ -5333,6 +5407,36 @@ async function reportInstanceIds(sql, reportId) {
     [reportId],
   );
   return rows.map((r) => r.instance_id);
+}
+
+// Every report must live in a project. Removing one from a project (closing a
+// tab, reordering, deleting the project) would otherwise leave it orphaned, so
+// any report that ends up with no project gets one of its own.
+async function ensureInstancesHomed(sql, instanceIds) {
+  for (const iid of [...new Set((instanceIds || []).filter(Boolean))]) {
+    try {
+      const [{ n }] = await sql.unsafe(
+        `SELECT COUNT(*)::int AS n FROM ${T.report_instances} WHERE instance_id = $1`, [iid]);
+      if (n > 0) continue;
+      const [inst] = await sql.unsafe(
+        `SELECT id, name, user_id, collaborators FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`, [iid]);
+      if (!inst) continue; // instance itself is gone — nothing to home
+      const pid = newObjectId();
+      await sql.unsafe(
+        `INSERT INTO ${T.reports} (id, name, user_id, collaborators) VALUES ($1,$2,$3,$4::jsonb)`,
+        [pid, inst.name || null, inst.user_id || null,
+         JSON.stringify(parseJsonbStr(inst.collaborators, []))],
+      );
+      await sql.unsafe(
+        `INSERT INTO ${T.report_instances} (id, report_id, instance_id, ord) VALUES ($1,$2,$3,0)
+         ON CONFLICT (report_id, instance_id) DO NOTHING`,
+        [newObjectId(), pid, iid],
+      );
+      console.log(`[v3] re-homed report ${iid} into new project ${pid}`);
+    } catch (e) {
+      console.error(`[v3] could not re-home report ${iid}:`, e.message);
+    }
+  }
 }
 
 // GET /v3/reports/preview?ids=a,b,c — ad-hoc comparison of instance ids, no save.
@@ -5348,30 +5452,81 @@ export async function previewReport(req, res) {
   }
 }
 
+// GET /v3/instances/:id/home-report — the project this report lives in.
+// The workspace calls this when it is opened on a bare /instance/<id> link (no
+// ?report=): without it the workspace would think the report has no project and
+// mint a second one on the next structural change.
+export async function getInstanceHomeReport(req, res) {
+  const sql = getSql();
+  try {
+    await ensureReportTables();
+    const uid = req.query.user_id ? String(req.query.user_id) : null;
+    // Prefer a project the caller owns / collaborates on; otherwise the oldest
+    // link wins, so the answer is stable for reports shared into several projects.
+    const rows = await sql.unsafe(
+      `SELECT r.id, r.name, r.user_id, ri.ord
+         FROM ${T.report_instances} ri
+         JOIN ${T.reports} r ON r.id = ri.report_id
+        WHERE ri.instance_id = $1
+        ORDER BY (r.user_id::text IS NOT DISTINCT FROM $2::text) DESC, r.created_at ASC
+        LIMIT 1`,
+      [req.params.id, uid],
+    );
+    if (!rows.length) return res.json({ report_id: null });
+    res.json({ report_id: rows[0].id, name: rows[0].name, user_id: rows[0].user_id });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
 // GET /v3/reports?user_id= — list saved reports (+ member count).
 export async function listReports(req, res) {
   const sql = getSql();
   try {
     await ensureReportTables();
     const uid = req.query.user_id ? String(req.query.user_id) : null;
+    // A project is visible when the caller owns it, is a collaborator on the
+    // project itself, OR is a collaborator on any report inside it. That last
+    // clause is the compatibility path: every share made before project-level
+    // sharing existed was written onto the member instances, so without it those
+    // projects would vanish from the collaborator's list.
     const rows = await sql.unsafe(
       `SELECT r.*,
               (SELECT COUNT(*) FROM ${T.report_instances} ri WHERE ri.report_id = r.id) AS instance_count,
               (SELECT COALESCE(array_agg(ri.instance_id ORDER BY ri.ord), '{}')
                  FROM ${T.report_instances} ri WHERE ri.report_id = r.id) AS instance_ids,
+              -- "shared WITH me": someone else owns it and I can see it.
+              (r.user_id IS DISTINCT FROM $1::text) AS is_shared,
+              -- kept under its own name for callers that want the old meaning
+              -- ("this project mixes in reports owned by someone else").
               EXISTS (
                 SELECT 1 FROM ${T.report_instances} ri
                   JOIN ${T.v3_instances} i ON i.id = ri.instance_id
                  WHERE ri.report_id = r.id
                    AND i.user_id IS DISTINCT FROM r.user_id
-              ) AS is_shared
+              ) AS has_foreign_members
          FROM ${T.reports} r
-        WHERE ($1::text IS NULL OR r.user_id = $1)
+        WHERE $1::text IS NULL
+           OR r.user_id::text = $1::text
+           OR EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(
+                  CASE WHEN jsonb_typeof(r.collaborators) = 'array'
+                       THEN r.collaborators ELSE '[]'::jsonb END
+                ) AS c(uid) WHERE c.uid = $1::text)
+           OR EXISTS (
+                SELECT 1 FROM ${T.report_instances} ri
+                  JOIN ${T.v3_instances} i ON i.id = ri.instance_id
+                 WHERE ri.report_id = r.id
+                   AND EXISTS (
+                     SELECT 1 FROM jsonb_array_elements_text(
+                       CASE WHEN jsonb_typeof(i.collaborators) = 'array'
+                            THEN i.collaborators ELSE '[]'::jsonb END
+                     ) AS c2(uid) WHERE c2.uid = $1::text))
         ORDER BY r.updated_at DESC
-        LIMIT 500`,
+        LIMIT 1000`,
       [uid],
     );
-    res.json({ reports: rows });
+    res.json({ reports: rows.map((r) => ({ ...r, collaborators: parseJsonbStr(r.collaborators, []) })) });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
@@ -5388,9 +5543,12 @@ export async function createReport(req, res) {
   try {
     await ensureReportTables();
     const id = newObjectId();
+    const collabs = Array.isArray(b.collaborators)
+      ? [...new Set(b.collaborators.map((x) => String(x || "").trim()).filter(Boolean))]
+      : [];
     await sql.unsafe(
-      `INSERT INTO ${T.reports} (id, name, user_id) VALUES ($1,$2,$3)`,
-      [id, b.name ? String(b.name) : null, b.user_id ? String(b.user_id) : (requesterId(req) || null)],
+      `INSERT INTO ${T.reports} (id, name, user_id, collaborators) VALUES ($1,$2,$3,$4::jsonb)`,
+      [id, b.name ? String(b.name) : null, b.user_id ? String(b.user_id) : (requesterId(req) || null), JSON.stringify(collabs)],
     );
     await replaceReportInstances(sql, id, instanceIds);
     const [row] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [id]);
@@ -5427,6 +5585,20 @@ export async function patchReport(req, res) {
       await sql.unsafe(`UPDATE ${T.reports} SET name = $1, updated_at = NOW() WHERE id = $2`,
         [b.name == null ? null : String(b.name), req.params.id]);
     }
+    // Project-level sharing: full-array replace, same normalization as
+    // patchInstance. Only the owner may change who a project is shared with —
+    // otherwise a collaborator could remove the owner or re-share it onward.
+    if (Array.isArray(b.collaborators)) {
+      const requester = requesterId(req);
+      if (row.user_id && requester && String(row.user_id) !== String(requester)) {
+        return res.status(403).json({ error: "Only the project owner can change sharing." });
+      }
+      const list = [...new Set(b.collaborators.map((x) => String(x || "").trim()).filter(Boolean))];
+      await sql.unsafe(
+        `UPDATE ${T.reports} SET collaborators = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+        [JSON.stringify(list), req.params.id],
+      );
+    }
     if (Array.isArray(b.instance_ids)) {
       const ids = normalizeInstanceIds(b.instance_ids);
       if (ids.length > MAX_REPORT_INSTANCES) {
@@ -5448,9 +5620,13 @@ export async function deleteReport(req, res) {
   const sql = getSql();
   try {
     await ensureReportTables();
+    // Deleting a project must never delete its reports — but it must not leave
+    // them homeless either, so any member that ends up in no project gets one.
+    const members = await reportInstanceIds(sql, req.params.id);
     await sql.unsafe(`DELETE FROM ${T.report_instances} WHERE report_id = $1`, [req.params.id]);
     const [row] = await sql.unsafe(`DELETE FROM ${T.reports} WHERE id = $1 RETURNING id`, [req.params.id]);
     if (!row) return res.status(404).json({ error: "Report not found" });
+    await ensureInstancesHomed(sql, members);
     res.status(204).end();
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });

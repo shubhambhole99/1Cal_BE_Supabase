@@ -60,6 +60,8 @@ router.get("/instances/:id", ctrl.getInstance);
 router.patch("/instances/:id", ctrl.patchInstance);
 router.delete("/instances/:id", ctrl.deleteInstance);
 router.post("/instances/:id/copy", ctrl.copyInstance);
+// Which project does this report live in? (bare /instance/<id> links)
+router.get("/instances/:id/home-report", ctrl.getInstanceHomeReport);
 // Instance links — live 2-way mimic between two reports.
 router.get("/instance-links", ctrl.listInstanceLinks);
 router.post("/instance-links", ctrl.createInstanceLink);

@@ -284,12 +284,17 @@ export async function ensureTables() {
     // grouping layer that lets N instances roll up into one comparison view.
     // (Option A from Current Architecture/scheme-report-architecture.html.)
     await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_reports")} (
-      id          VARCHAR(24) PRIMARY KEY,
-      name        TEXT,
-      user_id     VARCHAR(24),
-      created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      id            VARCHAR(24) PRIMARY KEY,
+      name          TEXT,
+      user_id       VARCHAR(24),
+      -- Project-level sharing. Mirrors v3_instances.collaborators (array of user
+      -- id strings) so a project can be shared as a unit instead of sharing each
+      -- member report one by one.
+      collaborators JSONB DEFAULT '[]'::jsonb,
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ DEFAULT NOW()
     )`);
+    await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_reports_user ON ${ref("v3_reports")}(user_id)`);
     // Link table: which instances belong to a report and in what column order.
     // ON DELETE CASCADE so removing a report drops its links (never its instances).
     await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_report_instances")} (
@@ -562,6 +567,8 @@ export async function ensureTables() {
       `ALTER TABLE ${ref("v3_versions")} ADD COLUMN IF NOT EXISTS notes TEXT`,
       `ALTER TABLE ${ref("v3_templates")} ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT FALSE`,
       `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS collaborators JSONB DEFAULT '[]'::jsonb`,
+      // Project-level sharing (v3_reports = the project wrapping N reports).
+      `ALTER TABLE ${ref("v3_reports")} ADD COLUMN IF NOT EXISTS collaborators JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS schemes JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS row_heights JSONB DEFAULT '{}'::jsonb`,
       // Per-page freeze panes (count of frozen top rows / left columns). Server-
