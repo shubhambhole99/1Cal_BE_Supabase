@@ -2,6 +2,7 @@ import { getSql } from "../db/index.js";
 import { newObjectId } from "../utils/objectId.js";
 import { convertLegacyPage, convertLegacyMasterInputs } from "../lib/legacyToV3.js";
 import { broadcast } from "../lib/events.js";
+import { verifiedUserId, V3_AUTH_STRICT } from "../middleware/v3Auth.js";
 
 // Active editing context used to live in BE/v3/.active-context.json. That
 // file path doesn't work on Vercel (read-only fs), so the active-context
@@ -3482,11 +3483,21 @@ export async function listInstances(req, res) {
 // CURRENT published_version_id (resolved at read time in getInstance). So
 // publishing a new version auto-upgrades every instance to that release —
 // instances are never pinned to a stale version.
-// Resolve the requesting user's id from the request (body for parity with the
-// direct-feasibility model; falls back to an auth-middleware-populated req.user).
+// Resolve the requesting user's id.
+//
+// The VERIFIED identity (from the JWT, via attachV3User) always wins. The body
+// fallback below is the legacy behaviour — the caller naming itself — and is
+// only reachable while V3_AUTH_STRICT is off. It exists so the ~220 frontend
+// call sites can be migrated to sending a token without a flag-day outage;
+// once the logs are clean, set V3_AUTH_STRICT=true and a client can no longer
+// claim to be someone else. Anything that gates money or access must use
+// requesterId() only in strict mode — see entitlements.
 function requesterId(req) {
+  const verified = verifiedUserId(req);
+  if (verified) return verified;
+  if (V3_AUTH_STRICT) return null;
   const b = req.body || {};
-  return b.user_id ?? b.userid ?? req.user?.id ?? req.user?.userId ?? null;
+  return b.user_id ?? b.userid ?? null;
 }
 
 // Edit-permission gate for an instance. The owner (v3_instances.user_id) or any

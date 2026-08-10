@@ -21,6 +21,7 @@ import gdriveRoutes from "./routes/gdriveRoutes.js";
 
 // v3 module (merged from BE 2 — self-contained under ./v3/*)
 import v3Routes from "./v3/routes/v3Routes.js";
+import { attachV3User } from "./v3/middleware/v3Auth.js";
 import { ensureTables as ensureV3Tables } from "./v3/db/ensureTables.js";
 
 // ── Crash backstops ─────────────────────────────────────────────────────────
@@ -100,7 +101,10 @@ app.use("/bill", billRoutes);
 app.use("/aboutus", aboutUsRoutes);
 app.use("/comments", commentRoutes);
 app.use("/gdrive", gdriveRoutes);
-app.use("/v3", v3Routes);
+// Identity for /v3: verify the token when one is sent, so req.user is available
+// to every v3 handler. Deliberately non-rejecting — routes that must not be
+// anonymous use requireV3Auth. See BE/v3/middleware/v3Auth.js.
+app.use("/v3", attachV3User, v3Routes);
 
 // Error handling
 app.use((err, req, res, next) => {
