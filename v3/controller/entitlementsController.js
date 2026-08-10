@@ -37,7 +37,12 @@ export const PAYWALL_ENABLED = String(process.env.PAYWALL_ENABLED || "").toLower
 export const PLOT_AREA_KEY = process.env.PLOT_AREA_MI_KEY || "Plot Area";
 export const CREDIT_PRICE_INR = 3000;
 
-/** Admins never pay and always read. Role lives in the JWT and on users.role. */
+/**
+ * Is this caller an admin? Used ONLY for authorisation — who may grant
+ * entitlements, and who may act on someone else's report. Deliberately NOT used
+ * to bypass the paywall: admins get an 'unlimited' grant instead, so they see
+ * the product the way customers do. Role lives in the JWT and on users.role.
+ */
 export async function isAdminUser(sql, req, userId) {
   const role = req.user?.role;
   if (role && /^(admin|superadmin|owner)$/i.test(String(role))) return true;
@@ -81,8 +86,11 @@ export async function entitlementSummary(sql, userId) {
 export async function canReadLockedPages(sql, req, instanceRow) {
   if (!PAYWALL_ENABLED) return { ok: true, reason: "paywall-off" };
   if (instanceRow?.unlocked_at) return { ok: true, reason: "report-unlocked" };
-  const uid = verifiedUserId(req);
-  if (await isAdminUser(sql, req, uid)) return { ok: true, reason: "admin" };
+  // No admin bypass. Admins are given an 'unlimited' grant instead, so they
+  // walk the same path as a paying customer — unlocking costs them nothing but
+  // they still see, and can test, exactly what everyone else sees. A bypass
+  // here would mean the people who own the product are the only ones who never
+  // look at it.
   return { ok: false, reason: "locked" };
 }
 
@@ -106,7 +114,6 @@ export async function guardOneTimeInput(sql, req, instanceId, tmi, nextValue) {
     `SELECT id, unlocked_at FROM ${T.instances} WHERE id = $1 LIMIT 1`, [instanceId]);
   // Already paid for: this report is settled, edit freely.
   if (inst?.unlocked_at) return { ok: true };
-  if (await isAdminUser(sql, req, verifiedUserId(req))) return { ok: true };
 
   const [prev] = await sql.unsafe(
     `SELECT value FROM ${T.imi} WHERE instance_id = $1 AND template_mi_key = $2 LIMIT 1`,
@@ -259,8 +266,7 @@ export async function changePlotArea(req, res) {
     const summary = await entitlementSummary(sql, uid);
     const alreadyUnlocked = !!inst.unlocked_at;
     let coveredBy = null;
-    if (admin) coveredBy = "admin";
-    else if (alreadyUnlocked) coveredBy = "already_unlocked";
+    if (alreadyUnlocked) coveredBy = "already_unlocked";
     else if (summary.unlimited) coveredBy = "unlimited";
     else if (summary.balance > 0) coveredBy = "credits";
     else {
