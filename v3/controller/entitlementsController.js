@@ -86,6 +86,51 @@ export async function canReadLockedPages(sql, req, instanceRow) {
   return { ok: false, reason: "locked" };
 }
 
+/**
+ * The "set once, pay to change" rule for a master input.
+ *
+ * A one-time input is free the first time a report sets it — that's the single
+ * question the reader is asked up front. Every later change is another
+ * feasibility run, so it has to go through changeLockedInput, which debits.
+ * Without this the paywall would be one PATCH away from irrelevant: the normal
+ * MI save path could rewrite the plot area for free, forever.
+ *
+ * Returns { ok: true } to allow the write, or { ok:false, status, body } to
+ * refuse it.
+ */
+export async function guardOneTimeInput(sql, req, instanceId, tmi, nextValue) {
+  if (!PAYWALL_ENABLED) return { ok: true };
+  if (!tmi?.one_time) return { ok: true };
+
+  const [inst] = await sql.unsafe(
+    `SELECT id, unlocked_at FROM ${T.instances} WHERE id = $1 LIMIT 1`, [instanceId]);
+  // Already paid for: this report is settled, edit freely.
+  if (inst?.unlocked_at) return { ok: true };
+  if (await isAdminUser(sql, req, verifiedUserId(req))) return { ok: true };
+
+  const [prev] = await sql.unsafe(
+    `SELECT value FROM ${T.imi} WHERE instance_id = $1 AND template_mi_key = $2 LIMIT 1`,
+    [instanceId, tmi.key]);
+  // Never set on this report → this is the one free answer.
+  if (!prev || prev.value == null || prev.value === "") return { ok: true };
+  // Same value re-sent (autosave, a re-render) → not a change, don't charge.
+  if (String(prev.value) === String(nextValue ?? "")) return { ok: true };
+
+  return {
+    ok: false,
+    status: 402,
+    body: {
+      error: `"${tmi.key}" has already been set for this report. Changing it runs the feasibility again.`,
+      code: "ONE_TIME_INPUT_LOCKED",
+      key: tmi.key,
+      current_value: prev.value,
+      price_inr: CREDIT_PRICE_INR,
+      // Where the client should send the change instead.
+      change_endpoint: `/v3/instances/${instanceId}/change-locked-input`,
+    },
+  };
+}
+
 // ── Routes ──────────────────────────────────────────────────────────────────
 
 /** GET /v3/entitlements/me — the signed-in user's plan + balance. */
@@ -171,9 +216,13 @@ export async function changePlotArea(req, res) {
   const sql = getSql();
   const instanceId = String(req.params.id);
   const b = req.body || {};
-  const newValue = b.plot_area == null ? null : String(b.plot_area);
+  // Works for ANY one-time input; `plot_area` is kept as the original spelling
+  // so the existing /change-plot-area route and its callers keep working.
+  const miKey = b.key ? String(b.key) : PLOT_AREA_KEY;
+  const raw = b.value != null ? b.value : b.plot_area;
+  const newValue = raw == null ? null : String(raw);
   if (newValue == null || newValue === "") {
-    return res.status(400).json({ error: "plot_area required" });
+    return res.status(400).json({ error: "value required" });
   }
   try {
     const uid = verifiedUserId(req);
@@ -198,9 +247,9 @@ export async function changePlotArea(req, res) {
         WHERE template_id = $1 AND key = $2
           AND ($3::text IS NULL OR version_id = $3)
         LIMIT 1`,
-      [inst.template_id, PLOT_AREA_KEY, inst.version_id || null],
+      [inst.template_id, miKey, inst.version_id || null],
     );
-    if (!tmi) return res.status(400).json({ error: `This scheme has no "${PLOT_AREA_KEY}" input.` });
+    if (!tmi) return res.status(400).json({ error: `This scheme has no "${miKey}" input.` });
 
     const [prev] = await sql.unsafe(
       `SELECT value FROM ${T.imi} WHERE instance_id = $1 AND template_mi_key = $2 LIMIT 1`,
@@ -240,10 +289,11 @@ export async function changePlotArea(req, res) {
       const ins = await tx.unsafe(
         `INSERT INTO ${T.cons}
            (id, user_id, instance_id, reason, credits, covered_by, plot_area_from, plot_area_to, idempotency_key)
-         VALUES ($1,$2,$3,'plot_area_change',$4,$5,$6,$7,$8)
+         VALUES ($1,$2,$3,$9,$4,$5,$6,$7,$8)
          ON CONFLICT (idempotency_key) DO NOTHING
          RETURNING id`,
-        [newObjectId(), uid, instanceId, cost, coveredBy, fromValue, newValue, idem],
+        [newObjectId(), uid, instanceId, cost, coveredBy, fromValue, newValue, idem,
+         miKey === PLOT_AREA_KEY ? "plot_area_change" : `one_time_change:${miKey}`],
       );
       if (!ins.length) { charged = false; return; }
       // Write the value the user asked for.
@@ -264,6 +314,8 @@ export async function changePlotArea(req, res) {
     res.json({
       ok: true,
       instance_id: instanceId,
+      key: miKey,
+      value: newValue,
       plot_area: newValue,
       unlocked: true,
       charged_credits: charged ? cost : 0,

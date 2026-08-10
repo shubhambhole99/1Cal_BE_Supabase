@@ -4,7 +4,7 @@ import { convertLegacyPage, convertLegacyMasterInputs } from "../lib/legacyToV3.
 import { broadcast } from "../lib/events.js";
 import { verifiedUserId, V3_AUTH_STRICT } from "../middleware/v3Auth.js";
 import {
-  canReadLockedPages, entitlementSummary,
+  canReadLockedPages, entitlementSummary, guardOneTimeInput,
   PAYWALL_ENABLED, PLOT_AREA_KEY, CREDIT_PRICE_INR,
 } from "./entitlementsController.js";
 
@@ -1520,6 +1520,9 @@ export async function patchMasterInput(req, res) {
     ["kind", "kind"],
     ["group_id", "group_id"],
     ["ord", "ord"],
+    // Paywall: a "one-time" input is free to set once on a report, and costs a
+    // report credit to change afterwards.
+    ["one_time", "one_time"],
   ];
   const sets = [];
   const params = [req.params.id];
@@ -4069,10 +4072,16 @@ export async function patchInstanceMasterInput(req, res) {
   // the template MI is later re-created under the same key; the key is the
   // stable identifier from the instance's perspective).
   const [tmi] = await sql.unsafe(
-    `SELECT id, key FROM ${T.master_input} WHERE id = $1 LIMIT 1`,
+    `SELECT id, key, COALESCE(one_time, FALSE) AS one_time FROM ${T.master_input} WHERE id = $1 LIMIT 1`,
     [templateMiId],
   );
   if (!tmi) return res.status(404).json({ error: "Template master input not found" });
+
+  // A one-time input is free to set ONCE on a report. Re-writing it is a new
+  // feasibility run, so it goes through the paid path instead — refused here,
+  // or the paywall would be one PATCH away from irrelevant.
+  const gate = await guardOneTimeInput(sql, req, instanceId, tmi, b.value);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
 
   const value = b.value == null ? null : String(b.value);
   await sql.unsafe(
@@ -4134,7 +4143,18 @@ export async function bulkPatchInstanceMasterInputs(req, res) {
   // Resolve each template MI's stable key in one query.
   const ids = [...new Set(items.map((it) => String(it.template_mi_id || "")).filter(Boolean))];
   if (!ids.length) return res.json({ updated: 0 });
-  const keyRows = await sql.unsafe(`SELECT id, key FROM ${T.master_input} WHERE id = ANY($1::text[])`, [ids]);
+  const keyRows = await sql.unsafe(
+    `SELECT id, key, COALESCE(one_time, FALSE) AS one_time FROM ${T.master_input} WHERE id = ANY($1::text[])`, [ids]);
+  // Same "set once, pay to change" rule as the single-value path. Gating only
+  // the PATCH would leave this wide open — the workspace sends values through
+  // here too, so an unpaid change could arrive in a bulk body instead.
+  for (const tmi of keyRows) {
+    if (!tmi.one_time) continue;
+    const item = items.find((it) => String(it.template_mi_id || "") === String(tmi.id));
+    if (!item) continue;
+    const gate = await guardOneTimeInput(sql, req, instanceId, tmi, item.value);
+    if (!gate.ok) return res.status(gate.status).json(gate.body);
+  }
   const keyById = Object.fromEntries(keyRows.map((r) => [r.id, r.key]));
 
   // Dedupe by key (last write wins) so the multi-row upsert can't touch a row twice.
@@ -5509,6 +5529,10 @@ const COMPOSE_MI_SELECT = `
   SELECT tmi.id, tmi.id AS template_mi_id, tmi.template_id, tmi.version_id,
          tmi.key, tmi.display_name, tmi.ref, tmi.type, tmi.options, tmi.section,
          tmi.ord, tmi.kind, tmi.group_id,
+         COALESCE(tmi.one_time, FALSE) AS one_time,
+         -- Has THIS report already set it? Drives the "first time is free"
+         -- rule and the warning shown before that first save.
+         (imi.value IS NOT NULL) AS has_instance_value,
          COALESCE(imi.value, tmi.default_value, tmi.value) AS value
     FROM ${T.master_input} tmi
     LEFT JOIN ${T.instance_mi} imi

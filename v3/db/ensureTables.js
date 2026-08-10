@@ -640,6 +640,9 @@ export async function ensureTables() {
       // v3_entitlement_consumptions so the hot read path (getInstance) needs no
       // join; rebuildable from that ledger at any time.
       `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS unlocked_at TIMESTAMPTZ`,
+      // A "one-time" input: free to set once on a report, costs a report credit
+      // to change after that. Plot Area is the first of these.
+      `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS one_time BOOLEAN DEFAULT FALSE`,
     ];
     for (const s of colAdds) await sql.unsafe(s);
 

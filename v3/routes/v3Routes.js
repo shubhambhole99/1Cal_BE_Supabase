@@ -65,6 +65,8 @@ router.post("/instances/:id/copy", ctrl.copyInstance);
 router.get("/instances/:id/home-report", ctrl.getInstanceHomeReport);
 // Paywall: the one action that spends a report credit.
 router.post("/instances/:id/change-plot-area", ent.changePlotArea);
+// Generic form: pay to change any one-time input. { key, value }
+router.post("/instances/:id/change-locked-input", ent.changePlotArea);
 // Instance links — live 2-way mimic between two reports.
 router.get("/instance-links", ctrl.listInstanceLinks);
 router.post("/instance-links", ctrl.createInstanceLink);
