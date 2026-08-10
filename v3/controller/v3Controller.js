@@ -3717,6 +3717,10 @@ export async function getInstance(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
+        COALESCE(tmi.one_time, FALSE) AS one_time,
+        -- Has THIS report already answered it? Drives "first answer is free"
+        -- and whether the viewer offers an inline field or a paid change.
+        (imi.value IS NOT NULL) AS has_instance_value,
         COALESCE(imi.value, tmi.default_value, tmi.value) AS value
      FROM ${T.master_input} tmi
      LEFT JOIN ${T.instance_mi} imi
@@ -4035,6 +4039,10 @@ export async function getInstanceMasterInputs(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
+        COALESCE(tmi.one_time, FALSE) AS one_time,
+        -- Has THIS report already answered it? Drives "first answer is free"
+        -- and whether the viewer offers an inline field or a paid change.
+        (imi.value IS NOT NULL) AS has_instance_value,
         COALESCE(imi.value, tmi.default_value, tmi.value) AS value
      FROM ${T.master_input} tmi
      LEFT JOIN ${T.instance_mi} imi
@@ -4115,6 +4123,10 @@ export async function patchInstanceMasterInput(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
+        COALESCE(tmi.one_time, FALSE) AS one_time,
+        -- Has THIS report already answered it? Drives "first answer is free"
+        -- and whether the viewer offers an inline field or a paid change.
+        (imi.value IS NOT NULL) AS has_instance_value,
         COALESCE(imi.value, tmi.default_value, tmi.value) AS value
      FROM ${T.master_input} tmi
      LEFT JOIN ${T.instance_mi} imi
