@@ -187,7 +187,7 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
   await tx.unsafe(
     `INSERT INTO ${T.master_input}
        (id, template_id, version_id, key, value, ref, type, options,
-        section, ord, display_name, kind, group_id, default_value)
+        section, ord, display_name, kind, group_id, default_value, one_time)
      SELECT
        substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
        m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -218,7 +218,7 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
        CASE WHEN m.group_id IS NULL THEN NULL
             ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
        END,
-       m.default_value
+       m.default_value, COALESCE(m.one_time, FALSE)
      FROM ${T.master_input} m
      WHERE m.template_id = $2 AND m.version_id = $3`,
     [newVersionId, templateId, sourceVersionId],
@@ -1493,7 +1493,14 @@ export async function patchMasterInput(req, res) {
   if (b.type === "group") {
     return res.status(400).json({ error: "type='group' is not a valid master-input type" });
   }
-  if (await rowIsPublished(sql, T.master_input, req.params.id)) {
+  // `one_time` is a commercial flag, not authored content — the same argument
+  // as `locked` on a page. Reports render off the PUBLISHED version, so an
+  // admin has to be able to mark an input paid-to-change there without forking
+  // a draft and republishing. A body that ONLY sets it bypasses the lock; any
+  // other field still needs a draft.
+  const miBodyKeys = Object.keys(b);
+  const commercialOnly = miBodyKeys.length > 0 && miBodyKeys.every((k) => k === "one_time");
+  if (!commercialOnly && (await rowIsPublished(sql, T.master_input, req.params.id))) {
     return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
   }
   // Name-reference: a `group_key` in the body is the authoritative group
@@ -2261,7 +2268,7 @@ export async function createVersion(req, res) {
         await tx.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id, default_value)
+              section, ord, display_name, kind, group_id, default_value, one_time)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -2292,7 +2299,7 @@ export async function createVersion(req, res) {
              CASE WHEN m.group_id IS NULL THEN NULL
                   ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
              END,
-             m.default_value
+             m.default_value, COALESCE(m.one_time, FALSE)
            FROM ${T.master_input} m
            WHERE m.template_id = $2 AND m.version_id = $3`,
           [newVersionId, templateId, sourceVersionId],
@@ -2477,7 +2484,7 @@ export async function restoreVersion(req, res) {
     await sql.unsafe(
       `INSERT INTO ${T.master_input}
          (id, template_id, version_id, key, value, ref, type, options,
-          section, ord, display_name, kind, group_id, default_value)
+          section, ord, display_name, kind, group_id, default_value, one_time)
        SELECT
          substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
          m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -2501,7 +2508,7 @@ export async function restoreVersion(req, res) {
          CASE WHEN m.group_id IS NULL THEN NULL
               ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
          END,
-         m.default_value
+         m.default_value, COALESCE(m.one_time, FALSE)
        FROM ${T.master_input} m
        WHERE m.template_id = $2 AND m.version_id = $3`,
       [targetVersionId, templateId, sourceVersionId],
@@ -2757,7 +2764,7 @@ export async function promoteToPublished(req, res) {
         const created = await sql.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id, default_value)
+              section, ord, display_name, kind, group_id, default_value, one_time)
            SELECT substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $2::text, m.key, m.value, m.ref, m.type,
              CASE
@@ -2774,7 +2781,7 @@ export async function promoteToPublished(req, res) {
                    ELSE opt END)
                  FROM jsonb_array_elements(m.options) AS opt)
              END,
-             m.section, m.ord, m.display_name, m.kind, NULL, m.default_value
+             m.section, m.ord, m.display_name, m.kind, NULL, m.default_value, COALESCE(m.one_time, FALSE)
            FROM ${T.master_input} m
            WHERE m.template_id = $1 AND m.version_id = $3 AND m.key = $4
              AND COALESCE(m.section,'') = COALESCE($5,'')
@@ -2842,7 +2849,7 @@ export async function promoteToPublished(req, res) {
         await tx.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id, default_value)
+              section, ord, display_name, kind, group_id, default_value, one_time)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -2863,7 +2870,7 @@ export async function promoteToPublished(req, res) {
              m.section, m.ord, m.display_name, m.kind,
              CASE WHEN m.group_id IS NULL THEN NULL
                   ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24) END,
-             m.default_value
+             m.default_value, COALESCE(m.one_time, FALSE)
            FROM ${T.master_input} m
            WHERE m.template_id = $2 AND m.version_id = $3 AND COALESCE(m.section,'') = COALESCE($4,'')`,
           [targetVersionId, templateId, sourceVersionId, section],
