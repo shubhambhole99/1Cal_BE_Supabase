@@ -158,12 +158,12 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
   await tx.unsafe(
     `INSERT INTO ${T.v3_pages}
        (id, template_id, version_id, name, ord, row_count, col_count, size,
-        orientation, scale, hidden, is_imported, columns_order, column_widths,
+        orientation, scale, hidden, locked, is_imported, columns_order, column_widths,
         row_heights, cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings)
      SELECT
        substr(encode(digest($1::text || id, 'sha256'), 'hex'), 1, 24),
        template_id, $1::text, name, ord, row_count, col_count, size,
-       orientation, scale, hidden, is_imported, columns_order, column_widths,
+       orientation, scale, hidden, COALESCE(locked, FALSE), is_imported, columns_order, column_widths,
        row_heights, cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings
      FROM ${T.v3_pages}
      WHERE template_id = $2 AND version_id = $3`,
@@ -756,8 +756,8 @@ export async function getTemplate(req, res) {
 
   const pages = await sql.unsafe(
     `SELECT id, name, ord, row_count, col_count, size, orientation, scale,
-            hidden, is_imported, version_id, schemes, freeze_rows, freeze_cols,
-            print_settings
+            hidden, COALESCE(locked, FALSE) AS locked, is_imported, version_id, schemes,
+            freeze_rows, freeze_cols, print_settings
      FROM ${T.v3_pages}
      WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)
      ORDER BY ord ASC, name ASC`,
@@ -1265,12 +1265,12 @@ export async function duplicatePage(req, res) {
           `INSERT INTO ${T.v3_pages} (
              id, template_id, version_id, name, ord,
              row_count, col_count, size, orientation, scale,
-             hidden, is_imported,
+             hidden, locked, is_imported,
              columns_order, column_widths, row_heights,
              cells, styles, merges, schemes,
              freeze_rows, freeze_cols, print_settings
            ) VALUES (
-             $1,$2,$3,$4,$5, $6,$7,$8,$9,$10, FALSE,FALSE,
+             $1,$2,$3,$4,$5, $6,$7,$8,$9,$10, FALSE,$21,FALSE,
              $11,$12,$13, $14,$15,$16,$17, $18,$19,$20)
            RETURNING *`,
           [
@@ -1282,6 +1282,8 @@ export async function duplicatePage(req, res) {
             contentRow.schemes ?? [],
             contentRow.freeze_rows ?? 0, contentRow.freeze_cols ?? 0,
             contentRow.print_settings ?? {},
+            // A copy of a paid page is still a paid page.
+            contentRow.locked ?? false,
           ],
         );
 
@@ -1821,7 +1823,7 @@ export async function reorderMasterInputGroups(req, res) {
 // calculations. A patch touching ONLY these skips the publish lock.
 // `hidden` (admin toggle to hide a page from regular users) is view-only too —
 // it changes who sees the tab, not the released content — so it belongs here.
-const COSMETIC_PAGE_FIELDS = new Set(["freeze_rows", "freeze_cols", "print_settings", "hidden"]);
+const COSMETIC_PAGE_FIELDS = new Set(["freeze_rows", "freeze_cols", "print_settings", "hidden", "locked"]);
 
 export async function patchPage(req, res) {
   const sql = getSql();
@@ -1837,7 +1839,7 @@ export async function patchPage(req, res) {
   // SOURCE template and synced on read. Allow only local, non-content fields
   // (visibility / order / freeze / print); reject anything that mutates the
   // mirrored content or the page name (the name is the link key).
-  const IMPORT_ALLOWED_FIELDS = new Set(["hidden", "ord", "freeze_rows", "freeze_cols", "print_settings"]);
+  const IMPORT_ALLOWED_FIELDS = new Set(["hidden", "locked", "ord", "freeze_rows", "freeze_cols", "print_settings"]);
   const wantsContentEdit = bodyKeys.some((k) => !IMPORT_ALLOWED_FIELDS.has(k));
   if (wantsContentEdit) {
     try {
@@ -1877,7 +1879,7 @@ export async function patchPage(req, res) {
     }
   }
 
-  const { cells, removeCells, styles, removeStyles, merges, name, hidden, ord, schemes, column_widths, row_heights } = req.body || {};
+  const { cells, removeCells, styles, removeStyles, merges, name, hidden, locked, ord, schemes, column_widths, row_heights } = req.body || {};
 
   const updates = [];
   const params = [id];
@@ -1938,6 +1940,14 @@ export async function patchPage(req, res) {
   if (typeof name === "string") {
     updates.push(`name = $${i}`);
     params.push(name);
+    i++;
+  }
+  if (typeof locked === "boolean") {
+    // Paywall flag. Cosmetic on purpose: an admin must be able to tick it on
+    // the PUBLISHED version (that's what reports render from) without forking
+    // a draft and republishing.
+    updates.push(`locked = $${i}`);
+    params.push(locked);
     i++;
   }
   if (typeof hidden === "boolean") {
