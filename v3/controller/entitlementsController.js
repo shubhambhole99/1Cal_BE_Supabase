@@ -1,0 +1,276 @@
+/**
+ * Entitlements — who may read a paid page, and what spending one costs.
+ *
+ * Model (see BE/v3/db/ensureTables.js):
+ *   v3_entitlement_grants        what a user was given: 'credits' (reports
+ *                                bought) or 'unlimited' (a subscription window)
+ *   v3_entitlement_consumptions  every debit, one row each
+ *   v3_instances.unlocked_at     denormalised "this report is paid for"
+ *   v3_pages.locked              which pages are paid-only
+ *
+ * Balance is never stored — it is always
+ *   SUM(grants.credits) - SUM(consumptions.credits)
+ * so it can be recomputed from the ledger and a double charge is visible as
+ * two rows for one instance.
+ *
+ * The whole gate is behind PAYWALL_ENABLED. With it off (the default) reads are
+ * unrestricted, which is what lets this ship before any page has been ticked.
+ */
+
+import { getSql } from "../db/index.js";
+import { newObjectId } from "../utils/objectId.js";
+import { verifiedUserId } from "../middleware/v3Auth.js";
+
+const SCHEMA = process.env.DB_SCHEMA || "final";
+const T = {
+  grants: `"${SCHEMA}"."v3_entitlement_grants"`,
+  cons: `"${SCHEMA}"."v3_entitlement_consumptions"`,
+  instances: `"${SCHEMA}"."v3_instances"`,
+  users: `"${SCHEMA}"."users"`,
+  mi: `"${SCHEMA}"."v3_master_input"`,
+  imi: `"${SCHEMA}"."v3_instance_master_input"`,
+};
+
+export const PAYWALL_ENABLED = String(process.env.PAYWALL_ENABLED || "").toLowerCase() === "true";
+/** The master input that holds the plot area. Keyed by the stable `key`, never
+ *  by id — the id differs per template, the key is identical everywhere. */
+export const PLOT_AREA_KEY = process.env.PLOT_AREA_MI_KEY || "Plot Area";
+export const CREDIT_PRICE_INR = 3000;
+
+/** Admins never pay and always read. Role lives in the JWT and on users.role. */
+export async function isAdminUser(sql, req, userId) {
+  const role = req.user?.role;
+  if (role && /^(admin|superadmin|owner)$/i.test(String(role))) return true;
+  if (!userId) return false;
+  try {
+    const [u] = await sql.unsafe(`SELECT role FROM ${T.users} WHERE id = $1 LIMIT 1`, [userId]);
+    return !!u?.role && /^(admin|superadmin|owner)$/i.test(String(u.role));
+  } catch { return false; }
+}
+
+/** { unlimited, balance, granted, consumed } for a user. */
+export async function entitlementSummary(sql, userId) {
+  if (!userId) return { unlimited: false, balance: 0, granted: 0, consumed: 0 };
+  const [g] = await sql.unsafe(
+    `SELECT
+       COALESCE(SUM(CASE WHEN kind = 'credits' THEN credits ELSE 0 END), 0)::int AS granted,
+       BOOL_OR(kind = 'unlimited' AND (expires_at IS NULL OR expires_at > NOW())) AS unlimited
+     FROM ${T.grants}
+     WHERE user_id = $1 AND revoked_at IS NULL AND starts_at <= NOW()`,
+    [userId],
+  );
+  const [c] = await sql.unsafe(
+    `SELECT COALESCE(SUM(credits), 0)::int AS consumed FROM ${T.cons} WHERE user_id = $1`,
+    [userId],
+  );
+  const granted = g?.granted || 0;
+  const consumed = c?.consumed || 0;
+  return {
+    unlimited: !!g?.unlimited,
+    balance: Math.max(0, granted - consumed),
+    granted,
+    consumed,
+  };
+}
+
+/**
+ * May this viewer read the report's locked pages?
+ * Unlocking is per-REPORT and permanent, so a collaborator on a report the
+ * owner paid for reads it without needing credits of their own.
+ */
+export async function canReadLockedPages(sql, req, instanceRow) {
+  if (!PAYWALL_ENABLED) return { ok: true, reason: "paywall-off" };
+  if (instanceRow?.unlocked_at) return { ok: true, reason: "report-unlocked" };
+  const uid = verifiedUserId(req);
+  if (await isAdminUser(sql, req, uid)) return { ok: true, reason: "admin" };
+  return { ok: false, reason: "locked" };
+}
+
+// ── Routes ──────────────────────────────────────────────────────────────────
+
+/** GET /v3/entitlements/me — the signed-in user's plan + balance. */
+export async function getMyEntitlement(req, res) {
+  const sql = getSql();
+  try {
+    const uid = verifiedUserId(req);
+    const summary = await entitlementSummary(sql, uid);
+    res.json({
+      ...summary,
+      user_id: uid,
+      admin: await isAdminUser(sql, req, uid),
+      paywall_enabled: PAYWALL_ENABLED,
+      price_inr: CREDIT_PRICE_INR,
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
+/** POST /v3/entitlements/grant — admin only. { user_id, kind, credits?, expires_at?, note? } */
+export async function grantEntitlement(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    const actor = verifiedUserId(req);
+    if (!(await isAdminUser(sql, req, actor))) {
+      return res.status(403).json({ error: "Admins only." });
+    }
+    const userId = b.user_id ? String(b.user_id) : null;
+    const kind = b.kind === "unlimited" ? "unlimited" : "credits";
+    const credits = kind === "credits" ? Math.max(1, Math.trunc(Number(b.credits) || 0)) : 0;
+    if (!userId) return res.status(400).json({ error: "user_id required" });
+    if (kind === "credits" && !credits) return res.status(400).json({ error: "credits must be >= 1" });
+
+    const id = newObjectId();
+    await sql.unsafe(
+      `INSERT INTO ${T.grants} (id, user_id, kind, credits, expires_at, order_id, granted_by, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [id, userId, kind, credits, b.expires_at || null, b.order_id ? String(b.order_id) : null,
+       actor, b.note ? String(b.note) : "admin grant"],
+    );
+    res.status(201).json({ id, ...(await entitlementSummary(sql, userId)) });
+  } catch (e) {
+    if (String(e.message || "").includes("duplicate key")) {
+      return res.status(409).json({ error: "That order has already been granted." });
+    }
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+/** GET /v3/entitlements/:userId — admin view of one user's ledger. */
+export async function getUserEntitlement(req, res) {
+  const sql = getSql();
+  try {
+    if (!(await isAdminUser(sql, req, verifiedUserId(req)))) {
+      return res.status(403).json({ error: "Admins only." });
+    }
+    const uid = String(req.params.userId);
+    const grants = await sql.unsafe(
+      `SELECT * FROM ${T.grants} WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200`, [uid]);
+    const consumptions = await sql.unsafe(
+      `SELECT * FROM ${T.cons} WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200`, [uid]);
+    res.json({ ...(await entitlementSummary(sql, uid)), user_id: uid, grants, consumptions });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
+/**
+ * POST /v3/instances/:id/change-plot-area
+ * Body: { plot_area, idempotency_key? }
+ *
+ * The one action that spends a credit. It writes the new plot area AND debits,
+ * in a single transaction, so the report can never end up charged-but-unchanged
+ * or changed-but-unbilled.
+ *
+ * - unlimited plan  → recorded with credits = 0
+ * - already unlocked → recorded with credits = 0 (you bought this report once;
+ *                      re-running it is free, which is what "unlocked forever"
+ *                      means)
+ * - zero balance    → 402, nothing written
+ * - retry/duplicate → idempotency_key is UNIQUE, so the second attempt returns
+ *                     the first result instead of charging again
+ */
+export async function changePlotArea(req, res) {
+  const sql = getSql();
+  const instanceId = String(req.params.id);
+  const b = req.body || {};
+  const newValue = b.plot_area == null ? null : String(b.plot_area);
+  if (newValue == null || newValue === "") {
+    return res.status(400).json({ error: "plot_area required" });
+  }
+  try {
+    const uid = verifiedUserId(req);
+    if (!uid) return res.status(401).json({ error: "Sign in to change the plot area." });
+
+    const [inst] = await sql.unsafe(
+      `SELECT id, user_id, template_id, version_id, unlocked_at, collaborators
+         FROM ${T.instances} WHERE id = $1 LIMIT 1`, [instanceId]);
+    if (!inst) return res.status(404).json({ error: "Report not found" });
+
+    // Only the owner or a collaborator may spend against a report.
+    const collabs = Array.isArray(inst.collaborators) ? inst.collaborators.map(String)
+      : (() => { try { return JSON.parse(inst.collaborators || "[]").map(String); } catch { return []; } })();
+    const admin = await isAdminUser(sql, req, uid);
+    if (!admin && String(inst.user_id) !== String(uid) && !collabs.includes(String(uid))) {
+      return res.status(403).json({ error: "You don't have access to this report." });
+    }
+
+    // Resolve the plot-area master input for this report's template.
+    const [tmi] = await sql.unsafe(
+      `SELECT id, key FROM ${T.mi}
+        WHERE template_id = $1 AND key = $2
+          AND ($3::text IS NULL OR version_id = $3)
+        LIMIT 1`,
+      [inst.template_id, PLOT_AREA_KEY, inst.version_id || null],
+    );
+    if (!tmi) return res.status(400).json({ error: `This scheme has no "${PLOT_AREA_KEY}" input.` });
+
+    const [prev] = await sql.unsafe(
+      `SELECT value FROM ${T.imi} WHERE instance_id = $1 AND template_mi_key = $2 LIMIT 1`,
+      [instanceId, tmi.key]);
+    const fromValue = prev?.value ?? null;
+
+    const summary = await entitlementSummary(sql, uid);
+    const alreadyUnlocked = !!inst.unlocked_at;
+    let coveredBy = null;
+    if (admin) coveredBy = "admin";
+    else if (alreadyUnlocked) coveredBy = "already_unlocked";
+    else if (summary.unlimited) coveredBy = "unlimited";
+    else if (summary.balance > 0) coveredBy = "credits";
+    else {
+      return res.status(402).json({
+        error: "You have no reports left.",
+        code: "NO_CREDITS",
+        balance: 0,
+        price_inr: CREDIT_PRICE_INR,
+      });
+    }
+    const cost = coveredBy === "credits" ? 1 : 0;
+    // Same key for a retry of the same change; a genuinely new change gets a
+    // new key from the client. Falls back to a value-derived key so a
+    // double-clicked button can't charge twice.
+    const idem = b.idempotency_key
+      ? `${instanceId}:${String(b.idempotency_key)}`
+      : `${instanceId}:${uid}:${newValue}`;
+
+    let charged = true;
+    await sql.begin(async (tx) => {
+      // ON CONFLICT DO NOTHING rather than catching the unique violation: in
+      // Postgres a failed statement poisons the whole transaction, so catching
+      // it would leave every following statement erroring with "current
+      // transaction is aborted". No row back = we've already served this exact
+      // request, so don't charge for it twice.
+      const ins = await tx.unsafe(
+        `INSERT INTO ${T.cons}
+           (id, user_id, instance_id, reason, credits, covered_by, plot_area_from, plot_area_to, idempotency_key)
+         VALUES ($1,$2,$3,'plot_area_change',$4,$5,$6,$7,$8)
+         ON CONFLICT (idempotency_key) DO NOTHING
+         RETURNING id`,
+        [newObjectId(), uid, instanceId, cost, coveredBy, fromValue, newValue, idem],
+      );
+      if (!ins.length) { charged = false; return; }
+      // Write the value the user asked for.
+      await tx.unsafe(
+        `INSERT INTO ${T.imi} (id, instance_id, template_mi_id, template_mi_key, value)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (instance_id, template_mi_key)
+         DO UPDATE SET value = EXCLUDED.value, template_mi_id = EXCLUDED.template_mi_id`,
+        [newObjectId(), instanceId, tmi.id, tmi.key, newValue],
+      );
+      // Unlocked forever, from the first paid run.
+      await tx.unsafe(
+        `UPDATE ${T.instances} SET unlocked_at = COALESCE(unlocked_at, NOW()), updated_at = NOW() WHERE id = $1`,
+        [instanceId]);
+    });
+
+    const after = await entitlementSummary(sql, uid);
+    res.json({
+      ok: true,
+      instance_id: instanceId,
+      plot_area: newValue,
+      unlocked: true,
+      charged_credits: charged ? cost : 0,
+      covered_by: charged ? coveredBy : "duplicate-request",
+      ...after,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}

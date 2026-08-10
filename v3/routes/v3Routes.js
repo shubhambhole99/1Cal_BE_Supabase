@@ -1,6 +1,7 @@
 import express from "express";
 import * as ctrl from "../controller/v3Controller.js";
 import * as payments from "../controller/paymentsController.js";
+import * as ent from "../controller/entitlementsController.js";
 import { addClient } from "../lib/events.js";
 
 const router = express.Router();
@@ -62,6 +63,8 @@ router.delete("/instances/:id", ctrl.deleteInstance);
 router.post("/instances/:id/copy", ctrl.copyInstance);
 // Which project does this report live in? (bare /instance/<id> links)
 router.get("/instances/:id/home-report", ctrl.getInstanceHomeReport);
+// Paywall: the one action that spends a report credit.
+router.post("/instances/:id/change-plot-area", ent.changePlotArea);
 // Instance links — live 2-way mimic between two reports.
 router.get("/instance-links", ctrl.listInstanceLinks);
 router.post("/instance-links", ctrl.createInstanceLink);
@@ -140,5 +143,10 @@ router.get("/payments", payments.listPayments);
 router.post("/payments/create-order", payments.createPaymentOrder);
 router.get("/payments/status/:orderId", payments.getPaymentStatus);
 router.post("/payments/webhook", payments.cashfreeWebhook);
+
+// ── Entitlements (paywall) ───────────────────────────────────────────────────
+router.get("/entitlements/me", ent.getMyEntitlement);
+router.post("/entitlements/grant", ent.grantEntitlement);
+router.get("/entitlements/:userId", ent.getUserEntitlement);
 
 export default router;

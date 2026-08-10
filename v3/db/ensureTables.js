@@ -464,6 +464,54 @@ export async function ensureTables() {
       updated_at          TIMESTAMPTZ DEFAULT NOW()
     )`);
 
+    // ── Entitlements ──────────────────────────────────────────────────────
+    // What a user is allowed to do. Deliberately NOT a column on `users`:
+    // PUT /user/:id is unauthenticated and writes req.body with no allowlist,
+    // so any balance living there would be editable by anyone.
+    //
+    // Two kinds of grant: 'credits' (a number of reports bought) and
+    // 'unlimited' (a subscription window). order_id is UNIQUE and carries the
+    // whole idempotency story — both the Cashfree webhook and the status poll
+    // fire for one order, and ON CONFLICT DO NOTHING makes double-granting
+    // structurally impossible. NULL order_id = granted by an admin.
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_entitlement_grants")} (
+      id          VARCHAR(24) PRIMARY KEY,
+      user_id     VARCHAR(24) NOT NULL,
+      kind        TEXT NOT NULL,
+      credits     INTEGER NOT NULL DEFAULT 0,
+      starts_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at  TIMESTAMPTZ,
+      order_id    TEXT UNIQUE,
+      granted_by  VARCHAR(24),
+      note        TEXT,
+      revoked_at  TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_ent_grants_user ON ${ref("v3_entitlement_grants")}(user_id)`);
+
+    // What a user has spent, one row per debit. The balance is always
+    // SUM(grants.credits) - SUM(consumptions.credits), so it can be recomputed
+    // from scratch and a double charge shows up as two rows for one instance.
+    // idempotency_key is UNIQUE so a retried/duplicated request cannot charge
+    // twice; `credits = 0` records an event that was covered by an unlimited
+    // plan or an already-unlocked report without taking anything.
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${ref("v3_entitlement_consumptions")} (
+      id              VARCHAR(24) PRIMARY KEY,
+      user_id         VARCHAR(24) NOT NULL,
+      instance_id     VARCHAR(24) NOT NULL,
+      reason          TEXT NOT NULL,
+      credits         INTEGER NOT NULL DEFAULT 1,
+      covered_by      TEXT NOT NULL,
+      grant_id        VARCHAR(24),
+      plot_area_from  TEXT,
+      plot_area_to    TEXT,
+      idempotency_key TEXT NOT NULL,
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await sql.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ent_cons_idem ON ${ref("v3_entitlement_consumptions")}(idempotency_key)`);
+    await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_ent_cons_user ON ${ref("v3_entitlement_consumptions")}(user_id)`);
+    await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_ent_cons_inst ON ${ref("v3_entitlement_consumptions")}(instance_id)`);
+
     // ── 2. Migrate existing schema if upgrading ─────────────────────────
     // 2a. Promote legacy table names to v3_master_input (preserves data).
     //   v3_template_master_input → master_input → v3_master_input
@@ -584,6 +632,14 @@ export async function ensureTables() {
       // so a delete-and-recreate of the template MI under the same key (e.g. on
       // JSON restore or xlsx import) preserves the instance's value.
       `ALTER TABLE ${ref("v3_instance_master_input")} ADD COLUMN IF NOT EXISTS template_mi_key TEXT`,
+      // Paywall. `locked` marks a page as paid-only; DEFAULT FALSE so the
+      // migration is a no-op on every existing page and nothing changes until
+      // an admin ticks pages in the template editor.
+      `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE`,
+      // When this report was paid for. NULL = still locked. Denormalised from
+      // v3_entitlement_consumptions so the hot read path (getInstance) needs no
+      // join; rebuildable from that ledger at any time.
+      `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS unlocked_at TIMESTAMPTZ`,
     ];
     for (const s of colAdds) await sql.unsafe(s);
 

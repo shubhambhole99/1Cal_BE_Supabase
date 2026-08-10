@@ -3,6 +3,10 @@ import { newObjectId } from "../utils/objectId.js";
 import { convertLegacyPage, convertLegacyMasterInputs } from "../lib/legacyToV3.js";
 import { broadcast } from "../lib/events.js";
 import { verifiedUserId, V3_AUTH_STRICT } from "../middleware/v3Auth.js";
+import {
+  canReadLockedPages, entitlementSummary,
+  PAYWALL_ENABLED, PLOT_AREA_KEY, CREDIT_PRICE_INR,
+} from "./entitlementsController.js";
 
 // Active editing context used to live in BE/v3/.active-context.json. That
 // file path doesn't work on Vercel (read-only fs), so the active-context
@@ -3610,6 +3614,42 @@ export async function createInstance(req, res) {
 // to the template's authored default `tmi.value`. The returned `id` is the
 // TEMPLATE MI's id — that's the stable identifier the FE uses to PATCH
 // values; the override row's id is never surfaced.
+// Every page that must stay readable for the UNLOCKED pages to still compute.
+//
+// The free page (Area) is full of cross-sheet formulas — Area!D4 is literally
+// ParametersOne!B5, the plot area itself. So the free set can't be "the pages
+// nobody ticked": it has to be their transitive precedent closure, or an admin
+// ticking ParametersOne silently blanks the page they meant to give away.
+// Resolved from the formulas themselves, so it stays right as sheets change.
+const SHEET_REF_RE = /(?:'([^']+)'|([A-Za-z0-9_][A-Za-z0-9_ .\-()+]*?))!\$?[A-Z]{1,3}\$?\d+/g;
+
+function freePageNames(pages) {
+  const byName = new Map(pages.map((p) => [p.name, p]));
+  const free = new Set(pages.filter((p) => !p.locked).map((p) => p.name));
+  const queue = [...free];
+  while (queue.length) {
+    const page = byName.get(queue.shift());
+    const cells = parseJsonbStr(page?.cells, {}) || {};
+    for (const cell of Object.values(cells)) {
+      // A formula is stored as { f: { expr: "=ParametersOne!B7" } }, not as a
+      // bare string — reading `f` directly finds nothing and the closure comes
+      // back empty, which silently strips the pages the free page is built on.
+      const raw = cell && typeof cell === "object" ? cell.f : null;
+      const f = typeof raw === "string" ? raw : raw?.expr;
+      if (!f || typeof f !== "string") continue;
+      SHEET_REF_RE.lastIndex = 0;
+      let m;
+      while ((m = SHEET_REF_RE.exec(f))) {
+        const name = (m[1] || m[2] || "").trim();
+        if (!name || free.has(name) || !byName.has(name)) continue;
+        free.add(name);
+        queue.push(name);
+      }
+    }
+  }
+  return free;
+}
+
 export async function getInstance(req, res) {
   const sql = getSql();
   const { id } = req.params;
@@ -3635,7 +3675,8 @@ export async function getInstance(req, res) {
     // back to the browser-natural height in the instance view.
     `SELECT id, name, ord, row_count, col_count, size, orientation, scale,
             hidden, is_imported, columns_order, column_widths, row_heights,
-            cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings
+            cells, styles, merges, schemes, freeze_rows, freeze_cols, print_settings,
+            COALESCE(locked, FALSE) AS locked
      FROM ${T.v3_pages}
      WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)
      ORDER BY ord ASC, name ASC`,
@@ -3728,6 +3769,29 @@ export async function getInstance(req, res) {
     console.error("[getInstance] scheme resolve failed:", e.message);
   }
 
+  // ── Paywall ───────────────────────────────────────────────────────────────
+  // A locked page's CONTENT must not leave the server for a reader who hasn't
+  // paid. The cells carry `f` (the formula), not just the computed value, so a
+  // client-side blur would hand over the entire calculation, not just numbers.
+  // The tab itself is still returned — a page that vanishes can't be sold — but
+  // it arrives with no cells, styles, merges or dimensions to rebuild it from.
+  const access = await canReadLockedPages(sql, req, inst);
+  const entitlement = await entitlementSummary(sql, verifiedUserId(req));
+  let visiblePages = pages;
+  if (!access.ok) {
+    const freeNames = freePageNames(pages);
+    visiblePages = pages.map((p) => {
+      if (!p.locked || freeNames.has(p.name)) return p;
+      return {
+        ...p,
+        cells: {}, styles: {}, merges: [],
+        columns_order: null, column_widths: {}, row_heights: {},
+        schemes: [], print_settings: {},
+        locked: true,
+      };
+    });
+  }
+
   res.json({
     instance: normalizeInstance(inst),
     template: tpl ? {
@@ -3739,10 +3803,21 @@ export async function getInstance(req, res) {
       branding: parseJsonbStr(tpl.branding, {}),
       published_version_id: tpl.published_version_id,
     } : null,
-    pages: pages.map(normalizePage),
+    pages: visiblePages.map(normalizePage),
     masterInputs: mis.map(normalizeMasterInput),
     masterInputGroups: groups,
     active_version_id: versionId,
+    // What the viewer is allowed to see, and why — the FE renders its lock
+    // overlay and "Change plot area" CTA from this instead of guessing.
+    access: {
+      unlocked: !!inst.unlocked_at,
+      can_read_locked: access.ok,
+      reason: access.reason,
+      paywall_enabled: PAYWALL_ENABLED,
+      plot_area_key: PLOT_AREA_KEY,
+      price_inr: CREDIT_PRICE_INR,
+      ...entitlement,
+    },
   });
 }
 
