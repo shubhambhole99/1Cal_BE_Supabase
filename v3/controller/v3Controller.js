@@ -36,6 +36,7 @@ const T = {
   test_sets: `"${SCHEMA}"."v3_test_sets"`,
   dashboard: `"${SCHEMA}"."v3_dashboard"`,
   sources: `"${SCHEMA}"."v3_sources"`,
+  users: `"${SCHEMA}"."users"`,
   reports: `"${SCHEMA}"."v3_reports"`,
   report_instances: `"${SCHEMA}"."v3_report_instances"`,
   comments: `"${SCHEMA}"."v3_comments"`,
@@ -117,6 +118,17 @@ async function resolveVersionId(sql, templateId, explicit) {
 // reject any write whose target version is the published one (403). Version-
 // management handlers (createVersion / publish / restore / ensureDraft) are
 // intentionally NOT guarded — they legitimately operate across versions.
+// How a user is named in the UI. Falls back down the chain because the columns
+// are unevenly filled: plenty of accounts have only a username (a phone number).
+const OWNER_NAME_SQL = (alias) => `NULLIF(TRIM(COALESCE(${alias}.first_name, '') || ' ' || COALESCE(${alias}.last_name, '')), '')`;
+// Phone as the user typed it: country code + number when both are present,
+// falling back to whichever half exists. `username` is excluded here — it holds
+// a generated numeric handle that only *looks* like a phone number.
+const ownerPhoneExpr = (alias) =>
+  `NULLIF(TRIM(COALESCE(NULLIF(TRIM(${alias}.phone_country_code), '') || ' ', '') || COALESCE(NULLIF(TRIM(${alias}.phone_number), ''), '')), '')`;
+const ownerNameExpr = (alias) =>
+  `COALESCE(${OWNER_NAME_SQL(alias)}, NULLIF(TRIM(${alias}.full_name), ''), NULLIF(TRIM(${alias}.name), ''), ${alias}.username, ${alias}.email)`;
+
 const PUBLISHED_LOCK_MSG =
   "This version was published and is locked for versioning. Fork it into a new draft to make changes.";
 // A version is locked for edits if it is, or ever was, published (`was_published`).
@@ -3816,8 +3828,22 @@ export async function getInstance(req, res) {
     });
   }
 
+  // Who owns this report, by name — the viewer shows it next to the report so
+  // a shared project makes it obvious whose work each column is.
+  let ownerName = null, ownerPhone = null;
+  if (inst.user_id) {
+    try {
+      const [u] = await sql.unsafe(
+        `SELECT ${ownerNameExpr("u")} AS owner_name, ${ownerPhoneExpr("u")} AS owner_phone
+           FROM ${T.users} u WHERE u.id = $1 LIMIT 1`,
+        [inst.user_id]);
+      ownerName = u?.owner_name || null;
+      ownerPhone = u?.owner_phone || null;
+    } catch { /* a missing user must not break the report */ }
+  }
+
   res.json({
-    instance: normalizeInstance(inst),
+    instance: { ...normalizeInstance(inst), owner_name: ownerName, owner_phone: ownerPhone },
     template: tpl ? {
       id: tpl.id,
       name: tpl.name,
@@ -5616,9 +5642,25 @@ async function composeInstanceColumn(sql, instanceId) {
   const versionId = tpl?.published_version_id || inst.version_id || null;
   const mis = await sql.unsafe(COMPOSE_MI_SELECT, [instanceId, inst.template_id, versionId]);
   await applyCalcPrefill(sql, inst, mis);
+  // Name the report's owner too — in a shared project each column can belong to
+  // a different person, and an id tells the reader nothing.
+  let ownerName = null, ownerPhone = null;
+  if (inst.user_id) {
+    try {
+      const [u] = await sql.unsafe(
+        `SELECT ${ownerNameExpr("u")} AS owner_name, ${ownerPhoneExpr("u")} AS owner_phone
+           FROM ${T.users} u WHERE u.id = $1 LIMIT 1`,
+        [inst.user_id]);
+      ownerName = u?.owner_name || null;
+      ownerPhone = u?.owner_phone || null;
+    } catch { /* ignore — a column without an owner name still renders */ }
+  }
   return {
     instanceId: inst.id,
     name: inst.name || null,
+    owner_id: inst.user_id || null,
+    owner_name: ownerName,
+    owner_phone: ownerPhone,
     calculation_id: inst.calculation_id || null,
     template: tpl ? { id: tpl.id, name: tpl.name, scheme: tpl.scheme } : null,
     masterInputs: mis.map(normalizeMasterInput),
@@ -5825,6 +5867,8 @@ export async function listReports(req, res) {
     // projects would vanish from the collaborator's list.
     const rows = await sql.unsafe(
       `SELECT r.*,
+              (SELECT ${ownerNameExpr("u")} FROM ${T.users} u WHERE u.id = r.user_id) AS owner_name,
+      (SELECT ${ownerPhoneExpr("u")} FROM ${T.users} u WHERE u.id = r.user_id) AS owner_phone,
               (SELECT COUNT(*) FROM ${T.report_instances} ri WHERE ri.report_id = r.id) AS instance_count,
               (SELECT COALESCE(array_agg(ri.instance_id ORDER BY ri.ord), '{}')
                  FROM ${T.report_instances} ri WHERE ri.report_id = r.id) AS instance_ids,
@@ -5896,7 +5940,10 @@ export async function getReport(req, res) {
   const sql = getSql();
   try {
     await ensureReportTables();
-    const [row] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [req.params.id]);
+    const [row] = await sql.unsafe(
+      `SELECT r.*, (SELECT ${ownerNameExpr("u")} FROM ${T.users} u WHERE u.id = r.user_id) AS owner_name,
+              (SELECT ${ownerPhoneExpr("u")} FROM ${T.users} u WHERE u.id = r.user_id) AS owner_phone
+         FROM ${T.reports} r WHERE r.id = $1 LIMIT 1`, [req.params.id]);
     if (!row) return res.status(404).json({ error: "Report not found" });
     const ids = await reportInstanceIds(sql, req.params.id);
     const view = await buildReportView(sql, ids);
