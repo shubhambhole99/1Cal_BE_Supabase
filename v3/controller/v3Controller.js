@@ -5168,7 +5168,9 @@ function graphSchemeCalcIds(graph, { landTitle, locality, plot, road }) {
   return ids;
 }
 
-// GET /v3/dcpr/schemes?land_title=&locality=&plot_area= — the applicable schemes.
+// GET /v3/dcpr/schemes?land_title=&locality=&plot_area=&road_width= — the
+// applicable schemes. Every parameter but land_title is optional; an input that
+// isn't supplied leaves its branches open rather than filtering them out.
 // Derived from the saved decision GRAPH (single source of truth, identical to the
 // public scheme selector and edited in /admin/report-workflow), NOT the legacy
 // flat rules table — so the report workflow's terminal schemes always match
