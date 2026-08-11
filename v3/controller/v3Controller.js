@@ -5081,7 +5081,7 @@ export async function saveDcprRules(req, res) {
 // doesn't answer (e.g. Society's building status) are left OPEN: every matching
 // branch is unioned, which is exactly the set the workflow presents (grouped) for
 // the user to pick.
-function graphSchemeCalcIds(graph, { landTitle, locality, plot }) {
+function graphSchemeCalcIds(graph, { landTitle, locality, plot, road }) {
   const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
   const edges = Array.isArray(graph?.edges) ? graph.edges : [];
   if (!nodes.length) return [];
@@ -5096,49 +5096,73 @@ function graphSchemeCalcIds(graph, { landTitle, locality, plot }) {
       if (c && c.id && !ids.includes(c.id)) ids.push(c.id);
     }
   };
-  // Whether an answer node is compatible with the caller's inputs. An answer only
-  // prunes the walk when we KNOW the relevant input; unknown inputs pass through.
-  const answerMatches = (ans, questionLabel) => {
-    const d = ans?.data || {};
-    const label = String(questionLabel || "").toLowerCase();
-    // Numeric plot-area band — the answer carries condition { op, value }.
-    if (d.condition && typeof d.condition.value === "number") {
-      if (plot == null) return true;
-      const v = plot, t = d.condition.value;
-      switch (d.condition.op) {
-        case ">=": return v >= t;
-        case ">":  return v > t;
-        case "<=": return v <= t;
-        case "<":  return v < t;
-        case "==": return v === t;
-        default:   return true;
-      }
+  // Does a number satisfy an answer's condition? One-sided ({ op, value }), a
+  // range ({ op: "between", min, max }), or the explicit fallback ({ op: "else" })
+  // which never matches directly — it only wins when no sibling did.
+  const condMatches = (c, v) => {
+    if (!c || c.op === "else") return false;
+    if (c.op === "between") {
+      const lo = typeof c.min === "number" ? (c.minInclusive ? v >= c.min : v > c.min) : true;
+      const hi = typeof c.max === "number" ? (c.maxInclusive ? v <= c.max : v < c.max) : true;
+      return lo && hi;
     }
-    // Land-title question — match by the answer's value (MHADA/SOCIETY/...).
+    if (typeof c.value !== "number") return false;
+    switch (c.op) {
+      case ">=": return v >= c.value;
+      case ">":  return v > c.value;
+      case "<=": return v <= c.value;
+      case "<":  return v < c.value;
+      case "==": return v === c.value;
+      default:   return false;
+    }
+  };
+  // Which caller input a numeric question is asking about. More than one number
+  // question exists now (plot area, road width), so the label decides — a
+  // question we don't recognise has no known input and stays open.
+  const numericInputFor = (label) => {
+    const l = String(label || "").toLowerCase();
+    if (l.includes("road")) return road;
+    if (l.includes("plot") || l.includes("area")) return plot;
+    return undefined;
+  };
+  // Which of a question's answers the walk may follow. An answer only prunes the
+  // walk when we KNOW the relevant input; unknown inputs leave every branch open,
+  // so the caller is offered the union (exactly what the workflow presents).
+  const allowedAnswers = (q, answers) => {
+    const label = String(q?.data?.label || q?.data?.question || "").toLowerCase();
+    const conditioned = answers.filter((a) => a?.data?.condition);
+    if (conditioned.length) {
+      const v = numericInputFor(label);
+      if (typeof v !== "number") return answers; // input not supplied — stay open
+      const hit = conditioned.filter((a) => condMatches(a.data.condition, v));
+      const fallback = answers.filter((a) => a?.data?.condition?.op === "else");
+      const uncond = answers.filter((a) => !a?.data?.condition);
+      return [...(hit.length ? hit : fallback), ...uncond];
+    }
     if (label.includes("land")) {
-      if (!landTitle) return true;
-      return String(d.value || "").toUpperCase() === landTitle.toUpperCase();
+      if (!landTitle) return answers;
+      return answers.filter((a) => String(a?.data?.value || "").toUpperCase() === landTitle.toUpperCase());
     }
-    // Location question (City / Suburb) — match by value (CITY/SUBURB).
     if (label.includes("location") || label.includes("city") || label.includes("suburb")) {
-      if (!locality) return true;
-      return String(d.value || "").toUpperCase() === String(locality).toUpperCase();
+      if (!locality) return answers;
+      return answers.filter((a) => String(a?.data?.value || "").toUpperCase() === String(locality).toUpperCase());
     }
     // Any other question (e.g. building status) is not asked by the report
     // workflow → leave open so every branch's schemes are unioned.
-    return true;
+    return answers;
   };
-  const walk = (id) => {
+  const walk = (id, seen = new Set()) => {
+    if (seen.has(id)) return;
     const n = byId[id];
     if (!n) return;
     if (n.type === "scheme") { addCalcs(n); return; }
-    for (const e of out[id] || []) {
-      const child = byId[e.target];
-      if (n.type === "question" && child?.type === "answer") {
-        if (!answerMatches(child, n.data?.label || n.data?.question)) continue;
-      }
-      walk(e.target);
-    }
+    const next = new Set(seen).add(id);
+    const kids = (out[id] || []).map((e) => byId[e.target]).filter(Boolean);
+    const answers = n.type === "question" ? kids.filter((k) => k.type === "answer") : [];
+    const follow = answers.length
+      ? [...allowedAnswers(n, answers), ...kids.filter((k) => k.type !== "answer")]
+      : kids;
+    for (const k of follow) walk(k.id, next);
   };
   walk(root.id);
   return ids;
@@ -5153,15 +5177,18 @@ export async function evaluateDcprSchemes(req, res) {
   const sql = getSql();
   const landTitle = String(req.query?.land_title || "").trim();
   const locality = String(req.query?.locality || "").trim() || null;
-  const rawPlot = req.query?.plot_area;
-  const plot = rawPlot == null || rawPlot === "" || isNaN(Number(rawPlot)) ? null : Number(rawPlot);
+  const num = (raw) => (raw == null || raw === "" || isNaN(Number(raw)) ? null : Number(raw));
+  const plot = num(req.query?.plot_area);
+  // Road width gates 33(9) (> 18 m) and the 9–12 m scheme set. Optional: when
+  // it isn't supplied every road branch stays open, as before.
+  const road = num(req.query?.road_width);
   if (!landTitle) return res.json({ schemes: [] });
   try {
     const [row] = await sql.unsafe(
       `SELECT payload FROM ${T.dcpr_graph} WHERE id = 'current' LIMIT 1`,
     );
     const graph = row ? parseJsonbStr(row.payload, { nodes: [], edges: [] }) : { nodes: [], edges: [] };
-    const ids = graphSchemeCalcIds(graph, { landTitle, locality, plot });
+    const ids = graphSchemeCalcIds(graph, { landTitle, locality, plot, road });
     if (!ids.length) return res.json({ schemes: [] });
     const calcs = await sql.unsafe(
       `SELECT id, name, retemplate_id, prefill_master_inputs, hide_v3, disabled
