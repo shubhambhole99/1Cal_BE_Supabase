@@ -5,7 +5,7 @@ import { broadcast } from "../lib/events.js";
 import { verifiedUserId, V3_AUTH_STRICT } from "../middleware/v3Auth.js";
 import {
   canReadLockedPages, entitlementSummary, guardOneTimeInput,
-  PAYWALL_ENABLED, PLOT_AREA_KEY, CREDIT_PRICE_INR,
+  PAYWALL_ENABLED, PLOT_AREA_KEY, CREDIT_PRICE_INR, isAdminUser,
 } from "./entitlementsController.js";
 
 // Active editing context used to live in BE/v3/.active-context.json. That
@@ -3682,9 +3682,54 @@ function freePageNames(pages) {
   return free;
 }
 
+// `v3_instances.pinned_at` gates the version switcher. version_id has existed on
+// the row for a long time and MANY legacy instances carry a dormant, never-honored
+// value (older reads always followed the published version). The switcher must NOT
+// retroactively activate those. So a pin only counts when pinned_at is set — which
+// ONLY changeInstanceVersion does. Self-healed here (cached) so the read paths that
+// SELECT it never 500 on a box that hasn't run ensureTables.
+let _instancePinnedAtCol = null;
+function ensureInstancePinnedAtCol(sql) {
+  if (_instancePinnedAtCol) return _instancePinnedAtCol;
+  _instancePinnedAtCol = sql
+    .unsafe(`ALTER TABLE ${T.v3_instances} ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`)
+    .catch((e) => { _instancePinnedAtCol = null; throw e; });
+  return _instancePinnedAtCol;
+}
+
+// Which template version does an instance render against? A deliberate per-instance
+// pin (set by the report viewer's version switcher → version_id + pinned_at) wins
+// WHEN it still points at a real version of this template; otherwise the report
+// follows the template's CURRENT published version. So the default (unpinned)
+// auto-tracks the latest published release, and a user's chosen version sticks
+// until they change it. Two guards:
+//   • pinned_at gate — a version_id with no pinned_at is a dormant legacy value and
+//     is ignored, so this feature can't retroactively repoint old reports.
+//   • draft privacy — a DRAFT (unpublished) pin is honored ONLY for admin viewers;
+//     everyone else falls back to published, so unreleased content never leaks.
+// Master-input values survive a switch because overrides bind by stable key (see
+// COMPOSE_MI_SELECT), not by version-scoped id.
+async function resolveInstanceVersion(sql, { versionPin, pinnedAt, templateId, publishedVersionId, viewerIsAdmin = false }) {
+  if (versionPin && pinnedAt) {
+    const [v] = await sql.unsafe(
+      `SELECT id, was_published FROM ${T.v3_versions} WHERE id = $1 AND template_id = $2 LIMIT 1`,
+      [versionPin, templateId],
+    );
+    if (v) {
+      const isDraft = v.was_published !== true && v.id !== (publishedVersionId || null);
+      if (!isDraft || viewerIsAdmin) return versionPin;
+      // Draft pin + non-admin viewer → never serve unpublished content; use published.
+    }
+    // A pin pointing at a deleted version falls through to published — never
+    // strand a report on a version that no longer exists.
+  }
+  return publishedVersionId || null;
+}
+
 export async function getInstance(req, res) {
   const sql = getSql();
   const { id } = req.params;
+  await ensureInstancePinnedAtCol(sql);
   const [inst] = await sql.unsafe(
     `SELECT * FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`,
     [id],
@@ -3695,10 +3740,12 @@ export async function getInstance(req, res) {
     `SELECT * FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
     [inst.template_id],
   );
-  // Always follow the template's CURRENT published version, ignoring any
-  // version_id pinned on the instance row — so every report (old or new)
-  // auto-resolves to the latest published release with no per-row DB edits.
-  const versionId = tpl?.published_version_id || inst.version_id || null;
+  await ensureVerForkCol(sql);
+  const viewerIsAdmin = await isAdminUser(sql, req, verifiedUserId(req));
+  const versionId = await resolveInstanceVersion(sql, {
+    versionPin: inst.version_id, pinnedAt: inst.pinned_at, templateId: inst.template_id,
+    publishedVersionId: tpl?.published_version_id, viewerIsAdmin,
+  });
 
   const pages = await sql.unsafe(
     // NOTE: `row_heights` must be included here — the instance grid in
@@ -3842,6 +3889,31 @@ export async function getInstance(req, res) {
     } catch { /* a missing user must not break the report */ }
   }
 
+  // Versions the viewer may pin this report to (drives the report viewer's
+  // version switcher). Non-admins get only the current published + previously
+  // published (frozen) releases; admins additionally get editable drafts.
+  // (viewerIsAdmin + ensureVerForkCol were already resolved at the top.)
+  let switchableVersions = [];
+  try {
+    const allVersions = await sql.unsafe(
+      `SELECT id, label, was_published, published_at, created_at
+         FROM ${T.v3_versions} WHERE template_id = $1 ORDER BY created_at ASC`,
+      [inst.template_id],
+    );
+    const publishedId = tpl?.published_version_id || null;
+    switchableVersions = allVersions
+      .filter((v) => viewerIsAdmin || v.was_published === true || v.id === publishedId)
+      .map((v) => ({
+        id: v.id,
+        label: v.label,
+        was_published: v.was_published === true,
+        published_at: v.published_at,
+        created_at: v.created_at,
+        is_published: v.id === publishedId,
+        is_draft: v.was_published !== true && v.id !== publishedId,
+      }));
+  } catch { /* versions are additive — a failure here must not break the report */ }
+
   res.json({
     instance: { ...normalizeInstance(inst), owner_name: ownerName, owner_phone: ownerPhone },
     template: tpl ? {
@@ -3857,6 +3929,14 @@ export async function getInstance(req, res) {
     masterInputs: mis.map(normalizeMasterInput),
     masterInputGroups: groups,
     active_version_id: versionId,
+    // Version switcher (report viewer). pinned_version_id NULL = following
+    // published. Only a LIVE pin (pinned_at set by the switcher) is reported —
+    // dormant legacy version_id values read as unpinned so the UI shows
+    // "Published (latest)" and the report keeps tracking published.
+    versions: switchableVersions,
+    published_version_id: tpl?.published_version_id || null,
+    pinned_version_id: inst.pinned_at ? (inst.version_id || null) : null,
+    viewer_is_admin: viewerIsAdmin,
     // What the viewer is allowed to see, and why — the FE renders its lock
     // overlay and "Change plot area" CTA from this instead of guessing.
     access: {
@@ -3914,6 +3994,73 @@ export async function patchInstance(req, res) {
   );
   if (!row) return res.status(404).json({ error: "Instance not found" });
   res.json(row);
+}
+
+// POST /v3/instances/:id/change-version
+// Body: { version_id: string | null }
+//
+// Pins the report to a specific template version, or unpins it (null → follow
+// the template's current published version). The choice is stored on
+// v3_instances.version_id and honoured by every read path (getInstance,
+// getInstanceMasterInputs, composeInstanceColumn) via resolveInstanceVersion, so
+// it survives reloads. Master-input values carry across the switch because
+// overrides bind by stable key, not by version-scoped id.
+//
+// Permission: the instance owner / a collaborator (checkInstancePermission) or an
+// admin. Identity comes from the VERIFIED token only (verifiedUserId), never the
+// request body — otherwise anyone could pass the owner's id (which getInstance
+// returns) and repoint a report they don't own. A DRAFT version (never published,
+// and not the current published one) can only be pinned by an admin — end-users
+// switch only between the current published release and previously published ones.
+export async function changeInstanceVersion(req, res) {
+  const sql = getSql();
+  const { id } = req.params;
+  const b = req.body || {};
+  const uid = verifiedUserId(req); // token-verified identity only — no body fallback
+  const admin = await isAdminUser(sql, req, uid);
+  const perm = await checkInstancePermission(sql, id, uid);
+  if (!perm.ok && !admin) return res.status(perm.status || 403).json({ error: perm.error || "Not allowed" });
+
+  const [inst] = await sql.unsafe(
+    `SELECT id, template_id FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`, [id],
+  );
+  if (!inst) return res.status(404).json({ error: "Instance not found" });
+
+  const raw = b.version_id;
+  const targetVersionId = raw == null || raw === "" ? null : String(raw);
+
+  if (targetVersionId) {
+    await ensureVerForkCol(sql);
+    const [ver] = await sql.unsafe(
+      `SELECT id, was_published FROM ${T.v3_versions} WHERE id = $1 AND template_id = $2 LIMIT 1`,
+      [targetVersionId, inst.template_id],
+    );
+    if (!ver) return res.status(400).json({ error: "That version does not belong to this report's template." });
+    const [tpl] = await sql.unsafe(
+      `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`, [inst.template_id],
+    );
+    const isDraft = ver.was_published !== true && ver.id !== (tpl?.published_version_id || null);
+    if (isDraft && !admin) {
+      return res.status(403).json({ error: "Only an admin can switch this report to an unpublished draft version." });
+    }
+    // Refuse a version with no report pages — it would render a blank report.
+    const [pc] = await sql.unsafe(
+      `SELECT COUNT(*)::int AS n FROM ${T.v3_pages} WHERE template_id = $1 AND version_id = $2`,
+      [inst.template_id, targetVersionId],
+    );
+    if (!pc || pc.n === 0) return res.status(400).json({ error: "That version has no report pages to show." });
+  }
+
+  // pinned_at is what actually ACTIVATES the pin (dormant legacy version_id values
+  // stay ignored). Set it when pinning; clear both when returning to published.
+  await ensureInstancePinnedAtCol(sql);
+  await sql.unsafe(
+    `UPDATE ${T.v3_instances}
+        SET version_id = $1, pinned_at = ${targetVersionId ? "NOW()" : "NULL"}, updated_at = NOW()
+      WHERE id = $2`,
+    [targetVersionId, id],
+  );
+  res.json({ ok: true, version_id: targetVersionId });
 }
 
 // POST /v3/instances/:id/copy
@@ -4040,16 +4187,23 @@ export async function deleteInstance(req, res) {
 export async function getInstanceMasterInputs(req, res) {
   const sql = getSql();
   const id = req.params.id;
+  await ensureInstancePinnedAtCol(sql);
+  await ensureVerForkCol(sql);
   const [inst] = await sql.unsafe(
-    `SELECT i.template_id, i.version_id, t.published_version_id
+    `SELECT i.template_id, i.version_id, i.pinned_at, t.published_version_id
        FROM ${T.v3_instances} i
        LEFT JOIN ${T.v3_templates} t ON t.id = i.template_id
       WHERE i.id = $1 LIMIT 1`,
     [id],
   );
   if (!inst) return res.status(404).json({ error: "Instance not found" });
-  // Always follow the template's current published version (see getInstance).
-  const miVersionId = inst.published_version_id || inst.version_id || null;
+  // Honour the instance's version pin (gated on pinned_at; drafts admin-only;
+  // falls back to published) — see resolveInstanceVersion / getInstance.
+  const viewerIsAdmin = await isAdminUser(sql, req, verifiedUserId(req));
+  const miVersionId = await resolveInstanceVersion(sql, {
+    versionPin: inst.version_id, pinnedAt: inst.pinned_at, templateId: inst.template_id,
+    publishedVersionId: inst.published_version_id, viewerIsAdmin,
+  });
   const rows = await sql.unsafe(
     `SELECT
         tmi.id,
@@ -5589,6 +5743,11 @@ function ensureReportTables() {
     // ENSURE_TABLES=false, so it has to self-migrate too or project sharing
     // silently 500s on boxes that never run ensureTables().
     .then(() => sql.unsafe(`ALTER TABLE ${T.reports} ADD COLUMN IF NOT EXISTS collaborators JSONB DEFAULT '[]'::jsonb`))
+    // Saved Compare & Combine layout: the user's custom combined columns
+    // (buckets of calc instanceIds) + the active section, so the exact
+    // comparison reloads next time the project opens. Self-migrated here for the
+    // same reason as collaborators (ENSURE_TABLES=false boxes never run ensureTables).
+    .then(() => sql.unsafe(`ALTER TABLE ${T.reports} ADD COLUMN IF NOT EXISTS compare_layout JSONB DEFAULT '{}'::jsonb`))
     .then(() => sql.unsafe(`CREATE TABLE IF NOT EXISTS ${T.report_instances} (
         id VARCHAR(24) PRIMARY KEY, report_id VARCHAR(24) NOT NULL,
         instance_id VARCHAR(24) NOT NULL, ord INTEGER NOT NULL DEFAULT 0, col_label TEXT,
@@ -5660,6 +5819,8 @@ async function applyCalcPrefill(sql, inst, mis) {
 // Load ONE instance as a report column: its composed master inputs (values +
 // metadata), plus light instance/template identity. Returns null if not found.
 async function composeInstanceColumn(sql, instanceId) {
+  await ensureInstancePinnedAtCol(sql);
+  await ensureVerForkCol(sql);
   const [inst] = await sql.unsafe(
     `SELECT * FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`, [instanceId],
   );
@@ -5668,7 +5829,13 @@ async function composeInstanceColumn(sql, instanceId) {
     `SELECT id, name, scheme, published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
     [inst.template_id],
   );
-  const versionId = tpl?.published_version_id || inst.version_id || null;
+  // Compare/report path has no request context → treat as non-admin, so a
+  // draft-pinned instance composes against published here (drafts never leak
+  // into the multi-report comparison). Pin still gated on pinned_at.
+  const versionId = await resolveInstanceVersion(sql, {
+    versionPin: inst.version_id, pinnedAt: inst.pinned_at, templateId: inst.template_id,
+    publishedVersionId: tpl?.published_version_id, viewerIsAdmin: false,
+  });
   const mis = await sql.unsafe(COMPOSE_MI_SELECT, [instanceId, inst.template_id, versionId]);
   await applyCalcPrefill(sql, inst, mis);
   // Name the report's owner too — in a shared project each column can belong to
@@ -6015,6 +6182,12 @@ export async function patchReport(req, res) {
       }
       await replaceReportInstances(sql, req.params.id, ids);
       await sql.unsafe(`UPDATE ${T.reports} SET updated_at = NOW() WHERE id = $1`, [req.params.id]);
+    }
+    // Saved Compare & Combine layout (custom combined columns + active section).
+    // Stored verbatim as JSON — the FE owns its shape { cols:[{members:[…]}], section }.
+    if (b.compare_layout !== undefined) {
+      await sql.unsafe(`UPDATE ${T.reports} SET compare_layout = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+        [JSON.stringify(b.compare_layout || {}), req.params.id]);
     }
     const [fresh] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [req.params.id]);
     const ids = await reportInstanceIds(sql, req.params.id);

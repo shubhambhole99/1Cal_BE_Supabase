@@ -67,6 +67,8 @@ router.get("/instances/:id/home-report", ctrl.getInstanceHomeReport);
 router.post("/instances/:id/change-plot-area", ent.changePlotArea);
 // Generic form: pay to change any one-time input. { key, value }
 router.post("/instances/:id/change-locked-input", ent.changePlotArea);
+// Version switcher: pin the report to a template version (null = published).
+router.post("/instances/:id/change-version", ctrl.changeInstanceVersion);
 // Instance links — live 2-way mimic between two reports.
 router.get("/instance-links", ctrl.listInstanceLinks);
 router.post("/instance-links", ctrl.createInstanceLink);

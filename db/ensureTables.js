@@ -89,6 +89,7 @@ export async function ensureTables() {
       phone_number: "varchar(32)",
       first_name: "text",
       last_name: "text",
+      active_session_id: "text",
       full_name: "text",
       password_hash: "text DEFAULT ''",
       created_at: "timestamptz DEFAULT now()",

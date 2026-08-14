@@ -235,8 +235,12 @@ export async function changePlotArea(req, res) {
     const uid = verifiedUserId(req);
     if (!uid) return res.status(401).json({ error: "Sign in to change the plot area." });
 
+    // pinned_at gates the version switcher; ensure it exists so the SELECT below
+    // never 500s on a box that hasn't run the render paths yet (idempotent).
+    await sql.unsafe(`ALTER TABLE ${T.instances} ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`).catch(() => {});
+
     const [inst] = await sql.unsafe(
-      `SELECT id, user_id, template_id, version_id, unlocked_at, collaborators
+      `SELECT id, user_id, template_id, version_id, pinned_at, unlocked_at, collaborators
          FROM ${T.instances} WHERE id = $1 LIMIT 1`, [instanceId]);
     if (!inst) return res.status(404).json({ error: "Report not found" });
 
@@ -248,13 +252,29 @@ export async function changePlotArea(req, res) {
       return res.status(403).json({ error: "You don't have access to this report." });
     }
 
-    // Resolve the plot-area master input for this report's template.
+    // Resolve the version this report actually RENDERS, so the one-time input we
+    // charge for is the same one the viewer sees. Mirrors resolveInstanceVersion
+    // in v3Controller (kept inline to avoid an import cycle): a deliberate pin
+    // (version_id + pinned_at) wins when valid, otherwise the published version —
+    // so the 44 dormant legacy version_id values resolve to published here too.
+    const [tplRow] = await sql.unsafe(
+      `SELECT published_version_id FROM "${SCHEMA}"."v3_templates" WHERE id = $1 LIMIT 1`,
+      [inst.template_id]);
+    let effVersionId = tplRow?.published_version_id || null;
+    if (inst.version_id && inst.pinned_at) {
+      const [v] = await sql.unsafe(
+        `SELECT id FROM "${SCHEMA}"."v3_versions" WHERE id = $1 AND template_id = $2 LIMIT 1`,
+        [inst.version_id, inst.template_id]);
+      if (v) effVersionId = inst.version_id;
+    }
+
+    // Resolve the plot-area master input for the version the report renders.
     const [tmi] = await sql.unsafe(
       `SELECT id, key FROM ${T.mi}
         WHERE template_id = $1 AND key = $2
           AND ($3::text IS NULL OR version_id = $3)
         LIMIT 1`,
-      [inst.template_id, miKey, inst.version_id || null],
+      [inst.template_id, miKey, effVersionId],
     );
     if (!tmi) return res.status(400).json({ error: `This scheme has no "${miKey}" input.` });
 
@@ -266,10 +286,24 @@ export async function changePlotArea(req, res) {
     const summary = await entitlementSummary(sql, uid);
     const alreadyUnlocked = !!inst.unlocked_at;
     let coveredBy = null;
-    if (alreadyUnlocked) coveredBy = "already_unlocked";
-    else if (summary.unlimited) coveredBy = "unlimited";
-    else if (summary.balance > 0) coveredBy = "credits";
-    else {
+    if (summary.unlimited) {
+      // Unlimited plan — set or change the plot area freely.
+      coveredBy = "unlimited";
+    } else if (alreadyUnlocked) {
+      // The plot area is already set for this report (it unlocked on the first
+      // set). It can be set ONLY ONCE: changing it now requires an unlimited
+      // plan. For a different plot area the user opens a new report instead.
+      return res.status(402).json({
+        error: "The plot area is set for this report and can only be changed on an unlimited plan. To run a different plot area, open a new report with \"Add calculation\".",
+        code: "PLOT_AREA_LOCKED",
+        needs_unlimited: true,
+        price_inr: CREDIT_PRICE_INR,
+      });
+    } else if (summary.balance > 0) {
+      // First time on this report — spend one report to set the plot area and
+      // unlock every page.
+      coveredBy = "credits";
+    } else {
       return res.status(402).json({
         error: "You have no reports left.",
         code: "NO_CREDITS",

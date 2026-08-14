@@ -643,6 +643,13 @@ export async function ensureTables() {
       // A "one-time" input: free to set once on a report, costs a report credit
       // to change after that. Plot Area is the first of these.
       `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS one_time BOOLEAN DEFAULT FALSE`,
+      // Saved Compare & Combine layout (custom combined columns + active section)
+      // so a project reopens with the exact comparison the user built.
+      `ALTER TABLE ${ref("v3_reports")} ADD COLUMN IF NOT EXISTS compare_layout JSONB DEFAULT '{}'::jsonb`,
+      // Version switcher: when a report was pinned to a specific template version
+      // (v3_instances.version_id). NULL = following the published version. Gates
+      // the pin so dormant legacy version_id values are never honored.
+      `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`,
     ];
     for (const s of colAdds) await sql.unsafe(s);
 

@@ -19,4 +19,8 @@ export const users = finalSchema.table("users", {
   phoneNumber: varchar("phone_number", { length: 32 }),
   firstName: text("first_name"),
   lastName: text("last_name"),
+  // Single active session: the id of the ONLY session currently allowed for this
+  // user. Set on every login; the JWT carries a matching `sid`. A token whose sid
+  // differs (an older device/browser) fails the /user/check heartbeat → logged out.
+  activeSessionId: text("active_session_id"),
 });

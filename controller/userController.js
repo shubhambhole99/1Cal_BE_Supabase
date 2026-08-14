@@ -68,8 +68,11 @@ export async function createUser(req, res) {
     const [existingByPhone] = await db.select().from(users).where(eq(users.phoneNumber, phoneData.user_phone_number)).limit(1);
 
     if (existingByPhone) {
+      // Single active session (last login wins) — same rule as /user/login.
+      const sid = newObjectId();
+      await db.update(users).set({ activeSessionId: sid }).where(eq(users.id, existingByPhone.id));
       const token = jwt.sign(
-        { userId: existingByPhone.id, username: existingByPhone.username, role: existingByPhone.role },
+        { userId: existingByPhone.id, username: existingByPhone.username, role: existingByPhone.role, sid },
         JWT_SECRET,
         { expiresIn: "20d" }
       );
@@ -82,6 +85,7 @@ export async function createUser(req, res) {
     }
 
     const hashedPassword = await bcrypt.hash(password1, 10);
+    const sid = newObjectId();
     const [created] = await db
       .insert(users)
       .values({
@@ -94,11 +98,12 @@ export async function createUser(req, res) {
         phoneNumber: phoneData.user_phone_number,
         firstName: phoneData.user_first_name,
         lastName: phoneData.user_last_name,
+        activeSessionId: sid,
       })
       .returning();
 
     const token = jwt.sign(
-      { userId: created.id, username: created.username, role: created.role },
+      { userId: created.id, username: created.username, role: created.role, sid },
       JWT_SECRET,
       { expiresIn: "20d" }
     );
@@ -142,8 +147,15 @@ export async function login(req, res) {
     const passwordMatch = await bcrypt.compare(password, finaluser.password);
     if (!passwordMatch) return res.status(401).json({ error: "Invalid password" });
 
+    // Single active session — "last login wins". Mint a fresh session id, make it
+    // the user's ONLY valid session, and stamp it into the JWT. Any token holding
+    // a different sid (an older device/browser) now fails the /user/check
+    // heartbeat and is logged out.
+    const sid = newObjectId();
+    await db.update(users).set({ activeSessionId: sid }).where(eq(users.id, finaluser.id));
+
     const token = jwt.sign(
-      { userId: finaluser.id, username: finaluser.username, role: finaluser.role },
+      { userId: finaluser.id, username: finaluser.username, role: finaluser.role, sid },
       JWT_SECRET,
       { expiresIn: "1h" }
     );
@@ -290,8 +302,35 @@ export async function deleteUser(req, res) {
   }
 }
 
+// Single-active-session heartbeat. The FE polls this; a 401 here means "this
+// device's session was superseded (or is a legacy/no-sid token) → log out".
+// `req.user` is the JWT payload set by isAuthenticated.
 export async function checkloginvalidity(req, res) {
   try {
+    const userId = req.user?.userId ?? req.user?.id;
+    const sid = req.user?.sid;
+
+    // No sid on the token → it was issued before single-session existed (or was
+    // minted without one). Every such token is invalid, which is exactly what
+    // forces all pre-existing sessions to re-login on rollout.
+    if (!userId || !sid) {
+      return res.status(401).json({ data: false, reason: "session_superseded" });
+    }
+
+    const [u] = await db
+      .select({ activeSessionId: users.activeSessionId })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+
+    if (!u) return res.status(401).json({ data: false, reason: "user_not_found" });
+
+    // The user's ONLY valid session is the most recent login. A mismatch means a
+    // newer login (another device/browser) took over — this device must log out.
+    if (u.activeSessionId !== sid) {
+      return res.status(401).json({ data: false, reason: "session_superseded" });
+    }
+
     res.json({ data: true });
   } catch (err) {
     console.error("[PUT /api/user/check] Error:", err);
