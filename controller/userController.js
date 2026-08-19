@@ -168,9 +168,9 @@ export async function login(req, res) {
 
 export async function getAllUsers(req, res) {
   try {
-    const hasListParams = ["page", "limit", "query", "sortBy", "sortDir"].some((k) =>
-      Object.prototype.hasOwnProperty.call(req.query, k)
-    );
+    const hasListParams = [
+      "page", "limit", "query", "sortBy", "sortDir", "role", "status", "v2",
+    ].some((k) => Object.prototype.hasOwnProperty.call(req.query, k));
 
     // Backwards compatibility: when called without list params, return the original array payload.
     if (!hasListParams) {
@@ -193,20 +193,47 @@ export async function getAllUsers(req, res) {
     const sortBy = String(req.query.sortBy ?? "createdAt").trim();
     const sortDir = String(req.query.sortDir ?? "desc").toLowerCase() === "asc" ? "asc" : "desc";
 
-    let filter = undefined;
+    // Facet filters. These have to run in SQL rather than on the client, or a
+    // filtered count would only ever describe the current page.
+    const roleFilter = String(req.query.role ?? "").trim().toLowerCase();
+    const statusFilter = String(req.query.status ?? "").trim().toLowerCase();
+    const v2Filter = String(req.query.v2 ?? "").trim().toLowerCase();
+
+    const conditions = [];
+
     if (query) {
       const pattern = `%${query}%`;
       const fullNameCond = sql`(coalesce(${users.firstName}, '') || ' ' || coalesce(${users.lastName}, '')) ILIKE ${pattern}`;
-      filter = or(
-        ilike(users.firstName, pattern),
-        ilike(users.lastName, pattern),
-        fullNameCond,
-        ilike(users.email, pattern),
-        ilike(users.phoneNumber, pattern),
-        ilike(users.role, pattern),
-        ilike(users.username, pattern)
+      conditions.push(
+        or(
+          ilike(users.firstName, pattern),
+          ilike(users.lastName, pattern),
+          fullNameCond,
+          ilike(users.email, pattern),
+          ilike(users.phoneNumber, pattern),
+          ilike(users.role, pattern),
+          ilike(users.username, pattern)
+        )
       );
     }
+
+    if (roleFilter && roleFilter !== "all") {
+      // role is a pg enum (prod.user_role), so cast to text before coalescing —
+      // coalescing to '' against the enum type itself is a cast error.
+      conditions.push(sql`lower(coalesce(${users.role}::text, '')) = ${roleFilter}`);
+    }
+
+    // status is nullable but defaults to active, so treat null as active.
+    if (statusFilter && statusFilter !== "all") {
+      conditions.push(sql`lower(coalesce(${users.status}::text, 'active')) = ${statusFilter}`);
+    }
+
+    if (v2Filter === "yes") conditions.push(eq(users.canCreateV2, true));
+    if (v2Filter === "no") {
+      conditions.push(sql`coalesce(${users.canCreateV2}, false) = false`);
+    }
+
+    const filter = conditions.length ? and(...conditions) : undefined;
 
     const orderExpr =
       sortBy === "createdAt"

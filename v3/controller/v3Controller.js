@@ -41,6 +41,7 @@ const T = {
   report_instances: `"${SCHEMA}"."v3_report_instances"`,
   comments: `"${SCHEMA}"."v3_comments"`,
   instance_links: `"${SCHEMA}"."v3_instance_links"`,
+  sheet_map: `"${SCHEMA}"."v3_sheet_map"`,
 };
 
 // ── JSONB read normalization ──────────────────────────────────────────────────
@@ -82,7 +83,18 @@ function normalizePage(p) {
 
 function normalizeMasterInput(mi) {
   if (!mi || typeof mi !== "object") return mi;
-  return { ...mi, options: parseJsonbStr(mi.options, []) };
+  return { ...mi, options: parseJsonbStr(mi.options, []), conditional: parseJsonbStr(mi.conditional, null) };
+}
+
+// Groups carry `presets` (JSONB), shaped:
+//   { mode: "auto" | "free" | "<presetId>",        <- the TEMPLATE's default
+//     list: [ { id, name, when?:{ref,op,value}, values:{ "<mi key>": "<value>" } } ] }
+// A report can override `mode` per group (v3_instances.preset_selections).
+// Parsed the same defensive way as the master-input columns: a legacy or
+// double-encoded row arrives as a JSON string and would otherwise be unusable.
+function normalizeMasterInputGroup(g) {
+  if (!g || typeof g !== "object") return g;
+  return { ...g, presets: parseJsonbStr(g.presets, null) };
 }
 
 function normalizeTemplate(t) {
@@ -98,6 +110,7 @@ function normalizeInstance(inst) {
   const out = { ...inst };
   if ("collaborators" in out) out.collaborators = parseJsonbStr(out.collaborators, []);
   if ("print_overrides" in out) out.print_overrides = parseJsonbStr(out.print_overrides, null);
+  if ("preset_selections" in out) out.preset_selections = parseJsonbStr(out.preset_selections, null);
   return out;
 }
 
@@ -184,13 +197,14 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
   // 2) Master-input groups
   await tx.unsafe(
     `INSERT INTO ${T.master_input_group}
-       (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+       (id, template_id, version_id, key, display_name, section, ord, parent_group_id, presets)
      SELECT
        substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
        g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
        CASE WHEN g.parent_group_id IS NULL THEN NULL
             ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
-       END
+       END,
+       g.presets
      FROM ${T.master_input_group} g
      WHERE g.template_id = $2 AND g.version_id = $3`,
     [newVersionId, templateId, sourceVersionId],
@@ -199,7 +213,7 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
   await tx.unsafe(
     `INSERT INTO ${T.master_input}
        (id, template_id, version_id, key, value, ref, type, options,
-        section, ord, display_name, kind, group_id, default_value, one_time)
+        section, ord, display_name, kind, group_id, default_value, one_time, conditional)
      SELECT
        substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
        m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -230,7 +244,7 @@ async function copyVersionContentInTx(tx, templateId, sourceVersionId, newVersio
        CASE WHEN m.group_id IS NULL THEN NULL
             ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
        END,
-       m.default_value, COALESCE(m.one_time, FALSE)
+       m.default_value, COALESCE(m.one_time, FALSE), m.conditional
      FROM ${T.master_input} m
      WHERE m.template_id = $2 AND m.version_id = $3`,
     [newVersionId, templateId, sourceVersionId],
@@ -476,10 +490,11 @@ export async function bulkCreateMasterInputs(req, res) {
       mi.default_value == null
         ? (mi.type === "multiselect" ? null : (mi.value == null ? null : String(mi.value)))
         : String(mi.default_value),
+      mi.conditional ?? null,   // raw object - see createMasterInput
     ]);
   }
 
-  const COLS = 14;
+  const COLS = 15;
   const BATCH = 1000; // 13 cols × 1000 = 13k binds, well under Postgres' 65535 cap
   try {
     for (let off = 0; off < rows.length; off += BATCH) {
@@ -493,7 +508,7 @@ export async function bulkCreateMasterInputs(req, res) {
       await sql.unsafe(
         `INSERT INTO ${T.master_input}
            (id, template_id, version_id, key, display_name, value, ref, type, options,
-            section, kind, group_id, ord, default_value)
+            section, kind, group_id, ord, default_value, conditional)
          VALUES ${tuples}`,
         slice.flat(),
       );
@@ -627,7 +642,7 @@ export async function importMasterInputs(req, res) {
     const taken = new Set(existing.map((r) => r.key));
     const skippedKeys = [];
     const renamed = {};
-    const COLS = 16;
+    const COLS = 17;
     const insRows = [];
     for (const m of selected) {
       let key = m.key;
@@ -647,6 +662,7 @@ export async function importMasterInputs(req, res) {
         m.default_value == null ? (m.type === "multiselect" ? null : (m.value == null ? null : String(m.value))) : String(m.default_value),
         // Provenance — flag as imported + record the source template (tooltip).
         true, b.source_template_id,
+        m.conditional ?? null,   // raw object - see createMasterInput
       ]);
     }
     // 3) Bulk insert the surviving MIs (same batched INSERT as bulkCreateMasterInputs).
@@ -659,7 +675,7 @@ export async function importMasterInputs(req, res) {
       await sql.unsafe(
         `INSERT INTO ${T.master_input}
            (id, template_id, version_id, key, display_name, value, ref, type, options,
-            section, kind, group_id, ord, default_value, is_imported, imported_from)
+            section, kind, group_id, ord, default_value, is_imported, imported_from, conditional)
          VALUES ${tuples}`,
         slice.flat(),
       );
@@ -1421,7 +1437,7 @@ export async function getMasterInputs(req, res) {
       ...normalizeMasterInput(r),
       group_key: r.group_id ? idToKey.get(r.group_id) ?? null : null,
     })),
-    masterInputGroups: groups,
+    masterInputGroups: groups.map(normalizeMasterInputGroup),
     active_version_id: versionId,
   });
 }
@@ -1465,8 +1481,8 @@ export async function createMasterInput(req, res) {
   await sql.unsafe(
     `INSERT INTO ${T.master_input}
        (id, template_id, version_id, key, display_name, value, ref, type, options,
-        section, kind, group_id, ord, default_value)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        section, kind, group_id, ord, default_value, conditional)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
     [
       id,
       b.template_id,
@@ -1484,6 +1500,11 @@ export async function createMasterInput(req, res) {
       // New instances seed from default_value. multiselect is excluded (stays
       // NULL → falls back to value); other types start with default == value.
       b.type === "multiselect" ? null : (b.default_value ?? b.value ?? null),
+      // Conditional (IF) rule. Bound as a raw object exactly like `options` -
+      // the driver serialises it into the jsonb column. Do NOT JSON.stringify:
+      // that stores a jsonb *string* (jsonb_typeof='string') and every ->/->>
+      // lookup then returns NULL. NULL here = no rule.
+      b.conditional ?? null,
     ],
   );
   const [row] = await sql.unsafe(`SELECT * FROM ${T.master_input} WHERE id = $1`, [id]);
@@ -1542,6 +1563,9 @@ export async function patchMasterInput(req, res) {
     // Paywall: a "one-time" input is free to set once on a report, and costs a
     // report credit to change afterwards.
     ["one_time", "one_time"],
+    // Conditional (IF) rule. Bound raw (like `options`) so the driver writes a
+    // real jsonb object rather than a double-encoded jsonb string.
+    ["conditional", "conditional"],
   ];
   const sets = [];
   const params = [req.params.id];
@@ -1610,7 +1634,7 @@ export async function listMasterInputGroups(req, res) {
      ORDER BY ord ASC`,
     [id, versionId],
   );
-  res.json({ masterInputGroups: rows, active_version_id: versionId });
+  res.json({ masterInputGroups: rows.map(normalizeMasterInputGroup), active_version_id: versionId });
 }
 
 // ── POST /v3/master-input-groups ──────────────────────────────────────────────
@@ -1637,12 +1661,13 @@ export async function createMasterInputGroup(req, res) {
     // bulk-create route's ON CONFLICT handling.
     const rows = await sql.unsafe(
       `INSERT INTO ${T.master_input_group}
-         (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         (id, template_id, version_id, key, display_name, section, ord, parent_group_id, presets)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (template_id, version_id, section, key) DO UPDATE
          SET display_name = EXCLUDED.display_name,
              ord = EXCLUDED.ord,
-             parent_group_id = EXCLUDED.parent_group_id
+             parent_group_id = EXCLUDED.parent_group_id,
+             presets = EXCLUDED.presets
        RETURNING *`,
       [
         id,
@@ -1653,6 +1678,9 @@ export async function createMasterInputGroup(req, res) {
         b.section ?? null,
         Number.isFinite(b.ord) ? b.ord : 0,
         b.parent_group_id ?? null,
+        // raw object - the driver serialises it into jsonb. JSON.stringify here
+        // would store a jsonb *string* and every ->/->> lookup would return NULL.
+        b.presets ?? null,
       ],
     );
     row = rows[0];
@@ -1698,11 +1726,12 @@ export async function bulkCreateMasterInputGroups(req, res) {
         const newId = newObjectId();
         const rows = await tx.unsafe(
           `INSERT INTO ${T.master_input_group}
-             (id, template_id, version_id, key, display_name, section, ord)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)
+             (id, template_id, version_id, key, display_name, section, ord, presets)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
            ON CONFLICT (template_id, version_id, section, key) DO UPDATE
              SET display_name = EXCLUDED.display_name,
-                 ord = EXCLUDED.ord
+                 ord = EXCLUDED.ord,
+                 presets = EXCLUDED.presets
            RETURNING id`,
           [
             newId,
@@ -1712,6 +1741,7 @@ export async function bulkCreateMasterInputGroups(req, res) {
             g.display_name ?? null,
             g.section ?? null,
             Number.isFinite(g.ord) ? g.ord : i,
+            g.presets ?? null,
           ],
         );
         const realId = rows[0]?.id || newId;
@@ -1746,6 +1776,8 @@ export async function patchMasterInputGroup(req, res) {
     ["section", "section"],
     ["ord", "ord"],
     ["parent_group_id", "parent_group_id"],
+    // Named value-sets for the whole group; bound raw like every other JSONB.
+    ["presets", "presets"],
   ];
   const sets = [];
   const params = [req.params.id];
@@ -2246,13 +2278,14 @@ export async function createVersion(req, res) {
         //    with "inconsistent types deduced for parameter $1".
         await tx.unsafe(
           `INSERT INTO ${T.master_input_group}
-             (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+             (id, template_id, version_id, key, display_name, section, ord, parent_group_id, presets)
            SELECT
              substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
              g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
              CASE WHEN g.parent_group_id IS NULL THEN NULL
                   ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
-             END
+             END,
+       g.presets
            FROM ${T.master_input_group} g
            WHERE g.template_id = $2 AND g.version_id = $3`,
           [newVersionId, templateId, sourceVersionId],
@@ -2280,7 +2313,7 @@ export async function createVersion(req, res) {
         await tx.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id, default_value, one_time)
+              section, ord, display_name, kind, group_id, default_value, one_time, conditional)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -2311,7 +2344,7 @@ export async function createVersion(req, res) {
              CASE WHEN m.group_id IS NULL THEN NULL
                   ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
              END,
-             m.default_value, COALESCE(m.one_time, FALSE)
+             m.default_value, COALESCE(m.one_time, FALSE), m.conditional
            FROM ${T.master_input} m
            WHERE m.template_id = $2 AND m.version_id = $3`,
           [newVersionId, templateId, sourceVersionId],
@@ -2478,13 +2511,14 @@ export async function restoreVersion(req, res) {
     // 2) MI groups — group id + parent_group_id remapped via the same hash.
     await sql.unsafe(
       `INSERT INTO ${T.master_input_group}
-         (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+         (id, template_id, version_id, key, display_name, section, ord, parent_group_id, presets)
        SELECT
          substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
          g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
          CASE WHEN g.parent_group_id IS NULL THEN NULL
               ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24)
-         END
+         END,
+       g.presets
        FROM ${T.master_input_group} g
        WHERE g.template_id = $2 AND g.version_id = $3`,
       [targetVersionId, templateId, sourceVersionId],
@@ -2496,7 +2530,7 @@ export async function restoreVersion(req, res) {
     await sql.unsafe(
       `INSERT INTO ${T.master_input}
          (id, template_id, version_id, key, value, ref, type, options,
-          section, ord, display_name, kind, group_id, default_value, one_time)
+          section, ord, display_name, kind, group_id, default_value, one_time, conditional)
        SELECT
          substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
          m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -2520,7 +2554,7 @@ export async function restoreVersion(req, res) {
          CASE WHEN m.group_id IS NULL THEN NULL
               ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24)
          END,
-         m.default_value, COALESCE(m.one_time, FALSE)
+         m.default_value, COALESCE(m.one_time, FALSE), m.conditional
        FROM ${T.master_input} m
        WHERE m.template_id = $2 AND m.version_id = $3`,
       [targetVersionId, templateId, sourceVersionId],
@@ -2745,6 +2779,10 @@ export async function promoteToPublished(req, res) {
         `UPDATE ${T.master_input} t SET
            value = s.value, default_value = s.default_value, ref = s.ref, type = s.type,
            display_name = s.display_name, kind = s.kind,
+           -- conditional (IF) rule: no id remapping needed, when.ref is page-name
+           -- based. Without this, "Promote this input" silently dropped the rule
+           -- AND the push-to-published preview never converged (it diffs the column).
+           conditional = s.conditional,
            options = CASE
              WHEN s.options IS NULL OR jsonb_typeof(s.options) <> 'array' THEN s.options
              ELSE (
@@ -2776,7 +2814,7 @@ export async function promoteToPublished(req, res) {
         const created = await sql.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id, default_value, one_time)
+              section, ord, display_name, kind, group_id, default_value, one_time, conditional)
            SELECT substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $2::text, m.key, m.value, m.ref, m.type,
              CASE
@@ -2793,7 +2831,7 @@ export async function promoteToPublished(req, res) {
                    ELSE opt END)
                  FROM jsonb_array_elements(m.options) AS opt)
              END,
-             m.section, m.ord, m.display_name, m.kind, NULL, m.default_value, COALESCE(m.one_time, FALSE)
+             m.section, m.ord, m.display_name, m.kind, NULL, m.default_value, COALESCE(m.one_time, FALSE), m.conditional
            FROM ${T.master_input} m
            WHERE m.template_id = $1 AND m.version_id = $3 AND m.key = $4
              AND COALESCE(m.section,'') = COALESCE($5,'')
@@ -2846,12 +2884,13 @@ export async function promoteToPublished(req, res) {
         // 2) Copy the source section's groups (id + parent_group_id remapped).
         await tx.unsafe(
           `INSERT INTO ${T.master_input_group}
-             (id, template_id, version_id, key, display_name, section, ord, parent_group_id)
+             (id, template_id, version_id, key, display_name, section, ord, parent_group_id, presets)
            SELECT
              substr(encode(digest($1::text || g.id, 'sha256'), 'hex'), 1, 24),
              g.template_id, $1::text, g.key, g.display_name, g.section, g.ord,
              CASE WHEN g.parent_group_id IS NULL THEN NULL
-                  ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24) END
+                  ELSE substr(encode(digest($1::text || g.parent_group_id, 'sha256'), 'hex'), 1, 24) END,
+       g.presets
            FROM ${T.master_input_group} g
            WHERE g.template_id = $2 AND g.version_id = $3 AND COALESCE(g.section,'') = COALESCE($4,'')`,
           [targetVersionId, templateId, sourceVersionId, section],
@@ -2861,7 +2900,7 @@ export async function promoteToPublished(req, res) {
         await tx.unsafe(
           `INSERT INTO ${T.master_input}
              (id, template_id, version_id, key, value, ref, type, options,
-              section, ord, display_name, kind, group_id, default_value, one_time)
+              section, ord, display_name, kind, group_id, default_value, one_time, conditional)
            SELECT
              substr(replace(gen_random_uuid()::text, '-', ''), 1, 24),
              m.template_id, $1::text, m.key, m.value, m.ref, m.type,
@@ -2882,7 +2921,7 @@ export async function promoteToPublished(req, res) {
              m.section, m.ord, m.display_name, m.kind,
              CASE WHEN m.group_id IS NULL THEN NULL
                   ELSE substr(encode(digest($1::text || m.group_id, 'sha256'), 'hex'), 1, 24) END,
-             m.default_value, COALESCE(m.one_time, FALSE)
+             m.default_value, COALESCE(m.one_time, FALSE), m.conditional
            FROM ${T.master_input} m
            WHERE m.template_id = $2 AND m.version_id = $3 AND COALESCE(m.section,'') = COALESCE($4,'')`,
           [targetVersionId, templateId, sourceVersionId, section],
@@ -3217,7 +3256,8 @@ export async function pushToPublishedPreview(req, res) {
          (s.id IS NOT NULL AND t.id IS NOT NULL AND (
             s.value IS DISTINCT FROM t.value OR s.default_value IS DISTINCT FROM t.default_value OR
             s.ref IS DISTINCT FROM t.ref OR s.type IS DISTINCT FROM t.type OR
-            s.display_name IS DISTINCT FROM t.display_name OR s.kind IS DISTINCT FROM t.kind
+            s.display_name IS DISTINCT FROM t.display_name OR s.kind IS DISTINCT FROM t.kind OR
+            s.conditional IS DISTINCT FROM t.conditional
          )) AS changed
        FROM (SELECT * FROM ${T.master_input} WHERE template_id = $1 AND version_id = $2) s
        FULL OUTER JOIN (SELECT * FROM ${T.master_input} WHERE template_id = $1 AND version_id = $3) t
@@ -3776,6 +3816,7 @@ export async function getInstance(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
+        tmi.conditional,
         COALESCE(tmi.one_time, FALSE) AS one_time,
         -- Has THIS report already answered it? Drives "first answer is free"
         -- and whether the viewer offers an inline field or a paid change.
@@ -3927,7 +3968,7 @@ export async function getInstance(req, res) {
     } : null,
     pages: visiblePages.map(normalizePage),
     masterInputs: mis.map(normalizeMasterInput),
-    masterInputGroups: groups,
+    masterInputGroups: groups.map(normalizeMasterInputGroup),
     active_version_id: versionId,
     // Version switcher (report viewer). pinned_version_id NULL = following
     // published. Only a LIVE pin (pinned_at set by the switcher) is reported —
@@ -3968,6 +4009,8 @@ export async function patchInstance(req, res) {
     ["name", "name"],
     ["collaborators", "collaborators"],
     ["print_overrides", "print_overrides"],
+    // Per-group preset mode chosen in THIS report (auto | free | <presetId>).
+    ["preset_selections", "preset_selections"],
   ];
   const sets = [];
   const params = [req.params.id];
@@ -4219,6 +4262,7 @@ export async function getInstanceMasterInputs(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
+        tmi.conditional,
         COALESCE(tmi.one_time, FALSE) AS one_time,
         -- Has THIS report already answered it? Drives "first answer is free"
         -- and whether the viewer offers an inline field or a paid change.
@@ -4303,6 +4347,7 @@ export async function patchInstanceMasterInput(req, res) {
         tmi.ord,
         tmi.kind,
         tmi.group_id,
+        tmi.conditional,
         COALESCE(tmi.one_time, FALSE) AS one_time,
         -- Has THIS report already answered it? Drives "first answer is free"
         -- and whether the viewer offers an inline field or a paid change.
@@ -4574,6 +4619,355 @@ export async function savePostInstanceWorkflow(req, res) {
       [rid, JSON.stringify(next)],
     );
     res.json({ ok: true, version_id: versionId, steps: nextSteps });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// ── Sheet mapping — where every analytics number comes from, per retemplate ───
+//
+// The analytics views used to compile their cell addresses in: Cashflow read
+// RevenueFlowMonth row 42 and ExpenseFlowMonth row 197, Compare read Summary
+// C17/G17/K17… That only holds while every scheme shares one layout, and they do
+// not. Seven of fifteen schemes keep their expense total on row 202, so reading
+// 197 there landed on "% Allocation per Stage" and the Cashflow expense came back
+// as 1.00 — a percentage read as crores. Worse, all twelve Compare KPI cells are
+// EMPTY on every scheme: that view has been rendering blanks.
+//
+// So a mapping is a list of FIELDS, each pointing at a full reference:
+//
+//     { key, label, group, ref: "Summary!D4", kind: "value" | "monthlyRow" }
+//
+// `ref` carries the sheet by PREFIX ("Summary", not "Summary_30(A)+33(7B)+12B")
+// so one mapping reads correctly in every scheme. `monthlyRow` means "this row,
+// read across the month columns"; `value` means a single cell.
+//
+// The registry is DERIVED per scheme from its own sheets — expense line items
+// come from the sheet's own labels, so a scheme with 37 heads yields 37 fields
+// without anyone typing them. Storage holds only OVERRIDES, keyed by field:
+//
+//     payload.versions[versionId] = { fields: { "<key>": "<ref>" } }
+//
+// so a scheme that has never been touched is still mapped correctly, and an
+// override survives the underlying sheet being re-detected.
+async function ensureSheetMapTable(sql) {
+  await sql
+    .unsafe(`CREATE TABLE IF NOT EXISTS ${T.sheet_map} (retemplate_id VARCHAR(24) PRIMARY KEY, payload JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ DEFAULT NOW())`)
+    .catch(() => {});
+}
+
+const SHEET_KINDS = ["Summary", "Financials", "Costing", "Area", "Scheme",
+  "RevenueFlowMonth", "ExpenseFlowMonth", "InterestFlowMonth", "ParametersOne"];
+
+// "Summary!D4" -> { sheet: "Summary", cell: "D4", col: "D", row: 4 }
+function parseRef(ref) {
+  // Split on the LAST "!" and validate only the cell. Page names here are things
+  // like `Summary_30(A)+33(7B)+12B` — parentheses, plus signs, spaces — so a
+  // character class on the sheet name rejected every real reference in the app.
+  const s = String(ref ?? "").trim();
+  const i = s.lastIndexOf("!");
+  if (i <= 0) return null;
+  const sheet = s.slice(0, i).trim().replace(/^'(.*)'$/, "$1").trim();
+  const m = /^\$?([A-Z]*)\$?(\d+)$/.exec(s.slice(i + 1).trim().toUpperCase());
+  if (!sheet || !m) return null;
+  return { sheet, col: m[1] || "", row: Number(m[2]), cell: `${m[1] || ""}${m[2]}` };
+}
+
+// The twelve Compare & Combine KPIs. The cells are what the code shipped with;
+// they resolve to nothing on the current Summary layout, which is exactly why
+// they are exposed here rather than left compiled in.
+const COMPARE_KPIS = [
+  ["kpi.totalRevenue", "Total Revenue", "Summary!G17", "₹ Cr", "sum", true],
+  ["kpi.totalProjectCost", "Total Project Cost", "Summary!C17", "₹ Cr", "sum", true],
+  ["kpi.totalProfit", "Total Profit", "Summary!K17", "₹ Cr", "sum", true],
+  ["kpi.totalSaleableBua", "Total Saleable BUA", "Summary!K20", "sqm", "sum", true],
+  ["kpi.costInclInterest", "Cost incl. Interest", "Summary!C18", "₹ Cr", "sum", false],
+  ["kpi.profitInclInterest", "Profit incl. Interest", "Summary!K18", "₹ Cr", "sum", false],
+  ["kpi.saleableToDeveloper", "Saleable to Developer", "Summary!K19", "Rera sqft", "sum", false],
+  ["kpi.netPlot", "Net Plot", "Summary!G20", "sqm", "sum", false],
+  ["kpi.avgSaleRate", "Avg Sale Rate / sqft", "Summary!C19", "₹", "rate", false],
+  ["kpi.costPerSqft", "Cost / sqft", "Summary!G18", "₹", "rate", false],
+  ["kpi.profitPct", "Profit % (on cost)", "Summary!G19", "%", "ratio", false],
+  ["kpi.effectiveFsi", "Effective FSI", "Summary!C20", "×", "ratio", false],
+];
+
+// Pull only what the registry needs: labels plus the cells a field might resolve
+// to. Selecting whole `cells` blobs moved megabytes per scheme and stalled the
+// endpoint outright, so everything is unpacked server-side.
+async function loadSheetFacts(sql, versionIds) {
+  const facts = new Map();          // versionId -> { kind -> { labels:Map, values:Map } }
+  if (!versionIds.length) return facts;
+  const rows = await sql.unsafe(
+    `SELECT p.version_id,
+            split_part(p.name, '_', 1) AS kind,
+            k.key AS addr,
+            k.value->>'v' AS v,
+            (k.value->'f'->>'expr') IS NOT NULL AS has_formula
+       FROM ${T.v3_pages} p
+       CROSS JOIN LATERAL jsonb_each(p.cells) k
+      WHERE p.version_id = ANY($1::text[])
+        AND jsonb_typeof(p.cells) = 'object'
+        AND k.key ~ '^[A-L][0-9]{1,3}$'`,
+    [versionIds],
+  );
+  for (const r of rows) {
+    if (!SHEET_KINDS.includes(r.kind)) continue;
+    let byVer = facts.get(r.version_id);
+    if (!byVer) { byVer = {}; facts.set(r.version_id, byVer); }
+    let sheet = byVer[r.kind];
+    if (!sheet) { sheet = { labels: new Map(), values: new Map() }; byVer[r.kind] = sheet; }
+    const m = /^([A-Z]{1,2})(\d+)$/.exec(r.addr);
+    if (!m) continue;
+    sheet.values.set(r.addr, { v: r.v, f: r.has_formula });
+    if ((m[1] === "A" || m[1] === "B") && r.v) {
+      const row = Number(m[2]);
+      if (!sheet.labels.has(row) || m[1] === "A") sheet.labels.set(row, String(r.v));
+    }
+  }
+  return facts;
+}
+
+// Build the field list a scheme actually has, from its own sheets.
+function buildFieldRegistry(sheets) {
+  const S = (k) => sheets?.[k] || { labels: new Map(), values: new Map() };
+  const fields = [];
+  const push = (key, label, group, ref, kind = "value", extra = {}) =>
+    fields.push({ key, label, group, ref, kind, ...extra });
+
+  const findRow = (kind, re, fallback) => {
+    for (const [row, text] of S(kind).labels) if (re.test(text)) return row;
+    return fallback;
+  };
+
+  // ── Cashflow: monthly rows, located by their own row labels ───────────────
+  const expTotalHeader = findRow("ExpenseFlowMonth", /^TOTAL EXPENSE COST$/, 196);
+  push("cf.revenue", "Cash collected", "Cashflow",
+    `RevenueFlowMonth!${findRow("RevenueFlowMonth", /^Cash Collected/i, 42)}`, "monthlyRow");
+  push("cf.expenseTotal", "Total expense", "Cashflow", `ExpenseFlowMonth!${expTotalHeader + 1}`, "monthlyRow");
+  push("cf.expenseInterest", "Interest (on expense sheet)", "Cashflow", `ExpenseFlowMonth!${expTotalHeader + 3}`, "monthlyRow");
+  push("cf.interest", "Interest this month", "Cashflow",
+    `InterestFlowMonth!${findRow("InterestFlowMonth", /^Interest this Month/i, 17)}`, "monthlyRow");
+  push("cf.stage", "Stage name", "Cashflow", "RevenueFlowMonth!3", "monthlyRow");
+  push("cf.date", "Start date", "Cashflow", "RevenueFlowMonth!8", "monthlyRow");
+
+  // ── Summary: every labelled row becomes a mappable value ──────────────────
+  // The area block puts its label in A/B and its number in C..G; the cost block
+  // puts the label in J with numbers in K (tenant) and L (sale).
+  const sum = S("Summary");
+  for (const [row, text] of [...sum.labels].sort((a, b) => a[0] - b[0])) {
+    if (!text || row > 40) continue;
+    const clean = String(text).replace(/\s+/g, " ").trim();
+    if (!clean || /^Sr No/i.test(clean) || clean.length > 60) continue;
+    const valueCol = ["C", "D", "E", "F", "G"].find((c) => sum.values.has(`${c}${row}`));
+    if (!valueCol) continue;
+    push(`sum.r${row}`, clean, "Summary — area", `Summary!${valueCol}${row}`);
+  }
+  for (let row = 3; row <= 12; row++) {
+    const label = sum.values.get(`J${row}`)?.v;
+    if (!label) continue;
+    const clean = String(label).replace(/\s+/g, " ").trim();
+    if (sum.values.has(`K${row}`)) push(`cost.k${row}`, `${clean} (tenant)`, "Summary — cost", `Summary!K${row}`);
+    if (sum.values.has(`L${row}`)) push(`cost.l${row}`, `${clean} (sale)`, "Summary — cost", `Summary!L${row}`);
+  }
+
+  // ── Expense flow: one field per line item, named by the sheet itself ──────
+  const exp = S("ExpenseFlowMonth");
+  for (let row = 10; row < expTotalHeader; row += 5) {
+    const name = exp.labels.get(row);
+    if (!name || !String(name).trim()) continue;
+    // A head is a five-row block: name, predicted, % allocation, actual, % actual.
+    // All three figures the detail view shows are separately mappable, because a
+    // scheme that lays its block out differently would otherwise silently read a
+    // neighbouring row — the same failure that made an expense total read 1.00.
+    const clean = String(name).replace(/\s+/g, " ").trim();
+    push(`exp.r${row}`, clean, "Expense flow — stages",
+      `ExpenseFlowMonth!${row + 1}`, "monthlyRow", { itemNameRow: row, part: "predicted" });
+    push(`exp.r${row}.pct`, `${clean} — % of head`, "Expense flow — stages",
+      `ExpenseFlowMonth!${row + 2}`, "monthlyRow", { itemNameRow: row, part: "pct" });
+    push(`exp.r${row}.actual`, `${clean} — actual`, "Expense flow — stages",
+      `ExpenseFlowMonth!${row + 3}`, "monthlyRow", { itemNameRow: row, part: "actual" });
+  }
+
+  // ── Revenue and interest monthly rows ────────────────────────────────────
+  // The month breakdown shows all three streams, so every labelled row on those
+  // sheets is mappable too — not just the expense heads.
+  const rev = S("RevenueFlowMonth");
+  for (const [row, name] of [...rev.labels].sort((a, b) => a[0] - b[0])) {
+    if (row < 10 || row > 48) continue;
+    const clean = String(name).replace(/\s+/g, " ").trim();
+    // Section headers ("5. Cash Collection") carry no monthly figure.
+    if (!clean || /^\d+\.\s/.test(clean)) continue;
+    if (!rev.values.has(`C${row}`) && !rev.values.has(`B${row}`)) continue;
+    push(`rev.r${row}`, clean, "Revenue flow — rows", `RevenueFlowMonth!${row}`, "monthlyRow");
+  }
+  const int = S("InterestFlowMonth");
+  for (const [row, name] of [...int.labels].sort((a, b) => a[0] - b[0])) {
+    if (row < 10 || row > 40) continue;
+    const clean = String(name).replace(/\s+/g, " ").trim();
+    if (!clean) continue;
+    if (!int.values.has(`C${row}`) && !int.values.has(`B${row}`)) continue;
+    push(`int.r${row}`, clean, "Interest flow — rows", `InterestFlowMonth!${row}`, "monthlyRow");
+  }
+
+  // ── Compare & Combine KPIs ───────────────────────────────────────────────
+  for (const [key, label, ref, unit, kind, hero] of COMPARE_KPIS) {
+    push(key, label, "Compare KPIs", ref, "value", { unit, metricKind: kind, hero });
+  }
+  return fields;
+}
+
+// Say whether each ref actually lands on something, so an empty mapping shows up
+// in the editor instead of silently rendering a blank KPI.
+function annotateFields(fields, sheets) {
+  return fields.map((f) => {
+    const p = parseRef(f.ref);
+    if (!p) return { ...f, resolves: "bad-ref" };
+    const sheet = sheets?.[p.sheet];
+    if (!sheet) return { ...f, resolves: "no-sheet" };
+    // A cell can exist purely as a styling shell — present in the sheet with no
+    // value and no formula. All twelve Compare KPI cells are exactly that, which
+    // is why that view renders blanks. "Present" is not "resolves".
+    const live = (c) => !!c && (c.v !== null || c.f);
+    if (f.kind === "monthlyRow") {
+      const hasAny = live(sheet.values.get(`C${p.row}`)) || live(sheet.values.get(`B${p.row}`));
+      return { ...f, resolves: hasAny ? "ok" : "empty", rowLabel: sheet.labels.get(p.row) || null };
+    }
+    const cell = sheet.values.get(p.cell);
+    if (!live(cell)) return { ...f, resolves: "empty" };
+    return { ...f, resolves: "ok", sample: cell.v ?? (cell.f ? "(formula)" : null) };
+  });
+}
+
+function sheetMapOverrides(payload, versionId) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const byVer = p.versions && typeof p.versions === "object" && !Array.isArray(p.versions) ? p.versions : {};
+  const doc = versionId && byVer[versionId] ? byVer[versionId] : {};
+  return doc.fields && typeof doc.fields === "object" && !Array.isArray(doc.fields) ? doc.fields : {};
+}
+
+// Carry overrides onto a new draft when a version is forked.
+async function copySheetMapForVersion(sql, templateId, sourceVersionId, newVersionId) {
+  if (!templateId || !sourceVersionId || !newVersionId) return;
+  await ensureSheetMapTable(sql);
+  const [row] = await sql.unsafe(`SELECT payload FROM ${T.sheet_map} WHERE retemplate_id = $1 LIMIT 1`, [templateId]);
+  if (!row) return;
+  const cur = parseJsonbStr(row.payload, {});
+  const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+  const src = byVer[sourceVersionId];
+  if (!src) return;
+  const next = { ...cur, versions: { ...byVer, [newVersionId]: src } };
+  await sql.unsafe(
+    `INSERT INTO ${T.sheet_map} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+    [templateId, JSON.stringify(next)],
+  );
+}
+
+async function mappingForVersions(sql, entries) {
+  const facts = await loadSheetFacts(sql, entries.map((e) => e.versionId).filter(Boolean));
+  return entries.map((e) => {
+    const sheets = facts.get(e.versionId) || {};
+    const base = buildFieldRegistry(sheets);
+    const fields = annotateFields(
+      base.map((f) => (e.overrides[f.key] ? { ...f, ref: e.overrides[f.key], overridden: true } : f)),
+      sheets,
+    );
+    return { ...e, fields, sheetsPresent: Object.keys(sheets) };
+  });
+}
+
+// GET /v3/sheet-mapping/:retemplateId?version=<id>
+export async function getSheetMapping(req, res) {
+  const sql = getSql();
+  try {
+    await ensureSheetMapTable(sql);
+    const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, req.query.version);
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.sheet_map} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
+    const overrides = sheetMapOverrides(row ? parseJsonbStr(row.payload, {}) : {}, versionId);
+    const [out] = await mappingForVersions(sql, [{ template_id: rid, versionId, overrides }]);
+    res.json({ ...out, version_id: versionId });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// GET /v3/sheet-mapping — every scheme, for the side-by-side view.
+export async function listSheetMappings(req, res) {
+  const sql = getSql();
+  try {
+    await ensureSheetMapTable(sql);
+    const wantDraft = String(req.query.draft ?? "true") !== "false";
+    const tpls = await sql.unsafe(
+      `SELECT id, name, ord, published_version_id FROM ${T.v3_templates}
+        WHERE disabled = false AND name LIKE 'Feasibility%' ORDER BY ord`);
+    const rows = await sql.unsafe(`SELECT retemplate_id, payload FROM ${T.sheet_map}`);
+    const byTpl = new Map(rows.map((r) => [r.retemplate_id, parseJsonbStr(r.payload, {})]));
+
+    const drafts = wantDraft
+      ? await sql.unsafe(
+          `SELECT DISTINCT ON (template_id) template_id, id, label FROM ${T.v3_versions}
+            WHERE template_id = ANY($1::text[]) AND label LIKE 'Current Editing%'
+            ORDER BY template_id, id`, [tpls.map((t) => t.id)])
+      : [];
+    const draftBy = new Map(drafts.map((d) => [d.template_id, d]));
+
+    const entries = tpls.map((t) => {
+      const d = draftBy.get(t.id);
+      const versionId = d ? d.id : (t.published_version_id || null);
+      return {
+        template_id: t.id,
+        name: t.name,
+        versionId,
+        version_label: d ? d.label : "Published",
+        overrides: versionId ? sheetMapOverrides(byTpl.get(t.id) || {}, versionId) : {},
+      };
+    }).filter((e) => e.versionId);
+
+    const schemes = await mappingForVersions(sql, entries);
+    res.json({ schemes: schemes.map((s) => ({ ...s, version_id: s.versionId })) });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+}
+
+// PUT /v3/sheet-mapping/:retemplateId — body { fields: { key: "Sheet!Cell" }, version_id? }
+// Admin only: this decides what every report of the scheme reports as revenue,
+// cost and profit. `null` for a field clears the override and returns it to
+// detection.
+export async function saveSheetMapping(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    if (!(await isAdminUser(sql, req, verifiedUserId(req)))) {
+      return res.status(403).json({ error: "Admin only" });
+    }
+    await ensureSheetMapTable(sql);
+    const rid = req.params.retemplateId;
+    const versionId = await resolveVersionId(sql, rid, b.version_id || req.query.version);
+    if (!versionId) return res.status(400).json({ error: "Template has no version to attach the mapping to" });
+
+    const incoming = b.fields && typeof b.fields === "object" && !Array.isArray(b.fields) ? b.fields : {};
+    for (const [k, v] of Object.entries(incoming)) {
+      if (v !== null && !parseRef(v)) {
+        return res.status(400).json({ error: `"${v}" is not a Sheet!Cell reference (field ${k})` });
+      }
+    }
+
+    const [row] = await sql.unsafe(`SELECT payload FROM ${T.sheet_map} WHERE retemplate_id = $1 LIMIT 1`, [rid]);
+    const cur = row ? parseJsonbStr(row.payload, {}) : {};
+    const byVer = cur.versions && typeof cur.versions === "object" && !Array.isArray(cur.versions) ? cur.versions : {};
+    const prevFields = (byVer[versionId] && byVer[versionId].fields) || {};
+    const merged = { ...prevFields };
+    for (const [k, v] of Object.entries(incoming)) { if (v === null) delete merged[k]; else merged[k] = v; }
+    const next = { ...cur, versions: { ...byVer, [versionId]: { ...(byVer[versionId] || {}), fields: merged } } };
+    await sql.unsafe(
+      `INSERT INTO ${T.sheet_map} (retemplate_id, payload, updated_at) VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (retemplate_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+      [rid, JSON.stringify(next)],
+    );
+    const [out] = await mappingForVersions(sql, [{ template_id: rid, versionId, overrides: merged }]);
+    res.json({ ok: true, version_id: versionId, ...out });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
@@ -5762,7 +6156,8 @@ const COMPOSE_MI_SELECT = `
   SELECT tmi.id, tmi.id AS template_mi_id, tmi.template_id, tmi.version_id,
          tmi.key, tmi.display_name, tmi.ref, tmi.type, tmi.options, tmi.section,
          tmi.ord, tmi.kind, tmi.group_id,
-         COALESCE(tmi.one_time, FALSE) AS one_time,
+         tmi.conditional,
+        COALESCE(tmi.one_time, FALSE) AS one_time,
          -- Has THIS report already set it? Drives the "first time is free"
          -- rule and the warning shown before that first save.
          (imi.value IS NOT NULL) AS has_instance_value,

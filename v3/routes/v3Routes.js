@@ -119,6 +119,12 @@ router.get("/dcpr/calculations", ctrl.resolveDcprCalculations);
 // Post-instance workflow config (common + per-calculation steps), per retemplate.
 router.get("/post-instance-workflow/:retemplateId", ctrl.getPostInstanceWorkflow);
 router.put("/post-instance-workflow/:retemplateId", ctrl.savePostInstanceWorkflow);
+// Sheet mapping: where the analytics views read their numbers, per retemplate.
+// The list route must be registered BEFORE the :retemplateId one or "sheet-mapping"
+// would never match the bare path.
+router.get("/sheet-mapping", ctrl.listSheetMappings);
+router.get("/sheet-mapping/:retemplateId", ctrl.getSheetMapping);
+router.put("/sheet-mapping/:retemplateId", ctrl.saveSheetMapping);
 // Post-instance FAQ config (common + per-calculation FAQs), per retemplate.
 router.get("/post-instance-faq/:retemplateId", ctrl.getPostInstanceFaq);
 router.put("/post-instance-faq/:retemplateId", ctrl.savePostInstanceFaq);

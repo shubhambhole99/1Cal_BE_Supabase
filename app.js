@@ -129,20 +129,20 @@ if (!process.env.VERCEL) {
   // 2) Optionally create/sync tables. Skipped unless ENSURE_TABLES="true".
   //    Skipping is faster and avoids touching the schema (e.g. the v3
   //    foreign-key error) when the tables already exist.
-  if (String(process.env.ENSURE_TABLES).toLowerCase() === "true") {
-    await ensureTables();
-    console.log("legacy tables ensured");
-    // v3 tables live in the schema defined by DB_SCHEMA. Failing to create
-    // them shouldn't take the legacy BE down, so we log and continue.
-    try {
-      await ensureV3Tables();
-      console.log("v3 tables ensured");
-    } catch (e) {
-      console.error("[ensureV3Tables] failed:", e.message);
-    }
-  } else {
-    console.log("Skipping table creation (set ENSURE_TABLES=true to enable)");
-  }
+  // if (String(process.env.ENSURE_TABLES).toLowerCase() === "true") {
+  //   await ensureTables();
+  //   console.log("legacy tables ensured");
+  //   // v3 tables live in the schema defined by DB_SCHEMA. Failing to create
+  //   // them shouldn't take the legacy BE down, so we log and continue.
+  //   try {
+  //     await ensureV3Tables();
+  //     console.log("v3 tables ensured");
+  //   } catch (e) {
+  //     console.error("[ensureV3Tables] failed:", e.message);
+  //   }
+  // } else {
+  //   console.log("Skipping table creation (set ENSURE_TABLES=true to enable)");
+  // }
 
   // 3) Start the server.
   app.listen(PORT, () => {

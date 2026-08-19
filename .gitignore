@@ -9,3 +9,6 @@ scripts/
 v3/.active-context.json
 
 .vercel
+
+# Throwaway migration/repair scripts and their backups (65MB, never shipped)
+delete later/

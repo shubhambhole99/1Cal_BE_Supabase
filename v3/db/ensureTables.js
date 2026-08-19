@@ -650,6 +650,21 @@ export async function ensureTables() {
       // (v3_instances.version_id). NULL = following the published version. Gates
       // the pin so dormant legacy version_id values are never honored.
       `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`,
+      // Conditional (IF) value rule on a master input:
+      //   { when:{ref}, op:"eq"|"ne", value, then, else }   NULL = no rule.
+      // Evaluated client-side (when.ref points at a live cell); an instance
+      // override always beats the rule.
+      `ALTER TABLE ${ref("v3_master_input")} ADD COLUMN IF NOT EXISTS conditional JSONB`,
+      // Group presets: named value-sets for every master input in a group, each
+      // optionally gated by a condition:
+      //   [{ id, name, when?:{ref,op,value}, values:{ "<mi key>": "<value>" } }]
+      // A preset defines the WHOLE group - inputs it does not list read as 0 - so
+      // switching presets never leaves stale values behind.
+      `ALTER TABLE ${ref("v3_master_input_group")} ADD COLUMN IF NOT EXISTS presets JSONB`,
+      // Per-report override of each group's preset mode:
+      //   { "<groupId>": "auto" | "free" | "<presetId>" }
+      // Absent = use the template's default, so existing reports are unaffected.
+      `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS preset_selections JSONB`,
     ];
     for (const s of colAdds) await sql.unsafe(s);
 
