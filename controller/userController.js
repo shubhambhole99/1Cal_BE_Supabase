@@ -211,7 +211,10 @@ export async function getAllUsers(req, res) {
           fullNameCond,
           ilike(users.email, pattern),
           ilike(users.phoneNumber, pattern),
-          ilike(users.role, pattern),
+          // role is a pg enum (prod.user_role) and ILIKE has no operator for
+          // enum types — without this cast the whole OR errors out and EVERY
+          // search returns "operator does not exist: prod.user_role ~~* unknown".
+          sql`${users.role}::text ILIKE ${pattern}`,
           ilike(users.username, pattern)
         )
       );

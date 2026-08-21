@@ -1,4 +1,4 @@
-import { text, varchar, boolean, timestamp, jsonb } from "drizzle-orm/pg-core";
+import { text, varchar, boolean, integer, timestamp, jsonb } from "drizzle-orm/pg-core";
 import { finalSchema } from "./finalSchema.js";
 
 export const users = finalSchema.table("users", {

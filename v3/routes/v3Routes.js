@@ -157,6 +157,10 @@ router.post("/payments/webhook", payments.cashfreeWebhook);
 // ── Entitlements (paywall) ───────────────────────────────────────────────────
 router.get("/entitlements/me", ent.getMyEntitlement);
 router.post("/entitlements/grant", ent.grantEntitlement);
+router.post("/entitlements/revoke", ent.revokeEntitlement);
+// Bulk balances for the admin users table (one call for the whole page).
+// Registered BEFORE "/entitlements/:userId" so it is not swallowed by it.
+router.post("/entitlements/summaries", ent.bulkEntitlementSummaries);
 router.get("/entitlements/:userId", ent.getUserEntitlement);
 
 export default router;

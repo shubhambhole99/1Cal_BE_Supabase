@@ -59,22 +59,46 @@ export async function entitlementSummary(sql, userId) {
   const [g] = await sql.unsafe(
     `SELECT
        COALESCE(SUM(CASE WHEN kind = 'credits' THEN credits ELSE 0 END), 0)::int AS granted,
-       BOOL_OR(kind = 'unlimited' AND (expires_at IS NULL OR expires_at > NOW())) AS unlimited
+       COALESCE(SUM(CASE WHEN kind = 'support_credits' THEN credits ELSE 0 END), 0)::int AS support_granted,
+       BOOL_OR(kind = 'unlimited' AND (expires_at IS NULL OR expires_at > NOW())) AS unlimited,
+       BOOL_OR(kind = 'support_unlimited' AND (expires_at IS NULL OR expires_at > NOW())) AS support_unlimited
      FROM ${T.grants}
      WHERE user_id = $1 AND revoked_at IS NULL AND starts_at <= NOW()`,
     [userId],
   );
+  // Support spends are tagged covered_by = 'support_credits' so they debit the
+  // support pool only - they must never come out of the paid self-serve balance.
   const [c] = await sql.unsafe(
-    `SELECT COALESCE(SUM(credits), 0)::int AS consumed FROM ${T.cons} WHERE user_id = $1`,
+    `SELECT
+       COALESCE(SUM(CASE WHEN covered_by IS DISTINCT FROM 'support_credits' THEN credits ELSE 0 END), 0)::int AS consumed,
+       COALESCE(SUM(CASE WHEN covered_by = 'support_credits' THEN credits ELSE 0 END), 0)::int AS support_consumed
+     FROM ${T.cons} WHERE user_id = $1`,
     [userId],
   );
   const granted = g?.granted || 0;
   const consumed = c?.consumed || 0;
+  const supportGranted = g?.support_granted || 0;
+  const supportConsumed = c?.support_consumed || 0;
+  const directUnlimited = !!g?.unlimited;
+  const supportUnlimited = !!g?.support_unlimited;
   return {
-    unlimited: !!g?.unlimited,
+    // An unlimited SUPPORT plan includes unlimited self-serve feasibility -
+    // support is the broader entitlement, so it grants the narrower one too.
+    // This is deliberately resolved here, at the single source of truth, so the
+    // paywall (canReadLockedPages / guardOneTimeInput / changePlotArea) and the
+    // navbar badge all honour the rule without each re-deriving it.
+    unlimited: directUnlimited || supportUnlimited,
+    // Whether unlimited was granted directly, kept so the admin screen can tell
+    // "granted outright" apart from "inherited from the support plan".
+    unlimited_direct: directUnlimited,
     balance: Math.max(0, granted - consumed),
     granted,
     consumed,
+    // Second pool: feasibility reports made WITH our support.
+    support_unlimited: supportUnlimited,
+    support_balance: Math.max(0, supportGranted - supportConsumed),
+    support_granted: supportGranted,
+    support_consumed: supportConsumed,
   };
 }
 
@@ -156,6 +180,102 @@ export async function getMyEntitlement(req, res) {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 }
 
+/** Grant kinds. 'credits'/'unlimited' are the original self-serve pool; the
+ *  support_* pair is the separate "made with our support" allowance. The two
+ *  unlimited flags are independent - one can be unlimited while the other is not. */
+export const GRANT_KINDS = new Set(["credits", "unlimited", "support_credits", "support_unlimited"]);
+
+/**
+ * POST /v3/entitlements/revoke - admin only. { user_id, kind }
+ * Revokes the user's live grants of one kind. This is how an unlimited plan is
+ * switched back off: grants are an append-only ledger, so "remove" means stamp
+ * revoked_at, never DELETE - the history stays auditable.
+ */
+export async function revokeEntitlement(req, res) {
+  const sql = getSql();
+  const b = req.body || {};
+  try {
+    if (!(await isAdminUser(sql, req, verifiedUserId(req)))) {
+      return res.status(403).json({ error: "Admins only." });
+    }
+    const userId = b.user_id ? String(b.user_id) : null;
+    if (!userId) return res.status(400).json({ error: "user_id required" });
+    if (!GRANT_KINDS.has(b.kind)) return res.status(400).json({ error: "unknown kind" });
+
+    const rows = await sql.unsafe(
+      `UPDATE ${T.grants} SET revoked_at = NOW()
+        WHERE user_id = $1 AND kind = $2 AND revoked_at IS NULL
+        RETURNING id`,
+      [userId, b.kind],
+    );
+    res.json({ revoked: rows.length, ...(await entitlementSummary(sql, userId)) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
+/**
+ * POST /v3/entitlements/summaries - admin only. { user_ids: [...] }
+ * Balances for many users in two queries, so the admin users table doesn't fire
+ * one request per row.
+ */
+export async function bulkEntitlementSummaries(req, res) {
+  const sql = getSql();
+  try {
+    if (!(await isAdminUser(sql, req, verifiedUserId(req)))) {
+      return res.status(403).json({ error: "Admins only." });
+    }
+    const ids = Array.isArray(req.body?.user_ids)
+      ? req.body.user_ids.map(String).filter(Boolean).slice(0, 500)
+      : [];
+    if (!ids.length) return res.json({ summaries: {} });
+
+    const grants = await sql.unsafe(
+      `SELECT user_id,
+         COALESCE(SUM(CASE WHEN kind = 'credits' THEN credits ELSE 0 END), 0)::int AS granted,
+         COALESCE(SUM(CASE WHEN kind = 'support_credits' THEN credits ELSE 0 END), 0)::int AS support_granted,
+         BOOL_OR(kind = 'unlimited' AND (expires_at IS NULL OR expires_at > NOW())) AS unlimited,
+         BOOL_OR(kind = 'support_unlimited' AND (expires_at IS NULL OR expires_at > NOW())) AS support_unlimited
+       FROM ${T.grants}
+       WHERE user_id = ANY($1) AND revoked_at IS NULL AND starts_at <= NOW()
+       GROUP BY user_id`,
+      [ids],
+    );
+    const cons = await sql.unsafe(
+      `SELECT user_id,
+         COALESCE(SUM(CASE WHEN covered_by IS DISTINCT FROM 'support_credits' THEN credits ELSE 0 END), 0)::int AS consumed,
+         COALESCE(SUM(CASE WHEN covered_by = 'support_credits' THEN credits ELSE 0 END), 0)::int AS support_consumed
+       FROM ${T.cons} WHERE user_id = ANY($1) GROUP BY user_id`,
+      [ids],
+    );
+
+    const consById = {};
+    for (const r of cons) consById[String(r.user_id)] = r;
+
+    const byId = {};
+    for (const id of ids) {
+      byId[id] = {
+        unlimited: false, unlimited_direct: false, balance: 0,
+        support_unlimited: false, support_balance: 0,
+      };
+    }
+    for (const g of grants) {
+      const id = String(g.user_id);
+      const c = consById[id] || {};
+      const directUnlimited = !!g.unlimited;
+      const supportUnlimited = !!g.support_unlimited;
+      byId[id] = {
+        // Same rule as entitlementSummary: unlimited support implies unlimited
+        // self-serve feasibility.
+        unlimited: directUnlimited || supportUnlimited,
+        unlimited_direct: directUnlimited,
+        balance: Math.max(0, (g.granted || 0) - (c.consumed || 0)),
+        support_unlimited: supportUnlimited,
+        support_balance: Math.max(0, (g.support_granted || 0) - (c.support_consumed || 0)),
+      };
+    }
+    res.json({ summaries: byId });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+}
+
 /** POST /v3/entitlements/grant — admin only. { user_id, kind, credits?, expires_at?, note? } */
 export async function grantEntitlement(req, res) {
   const sql = getSql();
@@ -166,10 +286,14 @@ export async function grantEntitlement(req, res) {
       return res.status(403).json({ error: "Admins only." });
     }
     const userId = b.user_id ? String(b.user_id) : null;
-    const kind = b.kind === "unlimited" ? "unlimited" : "credits";
-    const credits = kind === "credits" ? Math.max(1, Math.trunc(Number(b.credits) || 0)) : 0;
+    // Two independent pools, each with a finite and an unlimited flavour. `kind`
+    // is free-form TEXT, and every existing paywall query filters on the two
+    // original values, so the support kinds are invisible to current billing.
+    const kind = GRANT_KINDS.has(b.kind) ? b.kind : "credits";
+    const isUnlimited = kind === "unlimited" || kind === "support_unlimited";
+    const credits = isUnlimited ? 0 : Math.max(1, Math.trunc(Number(b.credits) || 0));
     if (!userId) return res.status(400).json({ error: "user_id required" });
-    if (kind === "credits" && !credits) return res.status(400).json({ error: "credits must be >= 1" });
+    if (!isUnlimited && !credits) return res.status(400).json({ error: "credits must be >= 1" });
 
     const id = newObjectId();
     await sql.unsafe(
