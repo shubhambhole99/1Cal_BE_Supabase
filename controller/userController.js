@@ -8,7 +8,10 @@ import { newObjectId } from "../utils/objectId.js";
 import { normalizeTimestampFields } from "../utils/date.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_secret_key";
-const validRoles = ["user", "admin", "client"];
+// Mirrors the prod.user_role Postgres enum — a value missing here is rejected
+// before it ever reaches the column, and a value missing from the enum fails at
+// insert. Keep the two in step.
+const validRoles = ["user", "admin", "client", "staff"];
 
 function fetchPhoneData(userJsonUrl) {
   return new Promise((resolve, reject) => {
@@ -59,7 +62,7 @@ export async function createUser(req, res) {
   if (existingByEmail) return res.status(400).json({ error: "Email already exists. Please SignIn" });
 
   if (!validRoles.includes(role)) {
-    return res.status(400).json({ error: "Invalid role. Valid roles are user, admin, or client." });
+    return res.status(400).json({ error: `Invalid role. Valid roles are ${validRoles.join(", ")}.` });
   }
   if (!user_json_url) return res.status(400).json({ error: "Missing user_json_url" });
 

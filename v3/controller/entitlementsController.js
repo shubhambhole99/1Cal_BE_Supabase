@@ -20,6 +20,7 @@
 import { getSql } from "../db/index.js";
 import { newObjectId } from "../utils/objectId.js";
 import { verifiedUserId } from "../middleware/v3Auth.js";
+import { collaboratorRole } from "../lib/collaborators.js";
 
 const SCHEMA = process.env.DB_SCHEMA || "final";
 const T = {
@@ -368,11 +369,13 @@ export async function changePlotArea(req, res) {
          FROM ${T.instances} WHERE id = $1 LIMIT 1`, [instanceId]);
     if (!inst) return res.status(404).json({ error: "Report not found" });
 
-    // Only the owner or a collaborator may spend against a report.
-    const collabs = Array.isArray(inst.collaborators) ? inst.collaborators.map(String)
-      : (() => { try { return JSON.parse(inst.collaborators || "[]").map(String); } catch { return []; } })();
+    // Only the owner or an EDITING collaborator may spend against a report.
+    // Deliberately not extended to open_access: spending draws down the owner's
+    // credits, so an "open to all" report must not let a passer-by do it.
+    // collaboratorRole reads both the legacy bare-id and the { id, role } shape.
     const admin = await isAdminUser(sql, req, uid);
-    if (!admin && String(inst.user_id) !== String(uid) && !collabs.includes(String(uid))) {
+    if (!admin && String(inst.user_id) !== String(uid)
+        && collaboratorRole(inst.collaborators, uid) !== "edit") {
       return res.status(403).json({ error: "You don't have access to this report." });
     }
 

@@ -7,6 +7,11 @@ import {
   canReadLockedPages, entitlementSummary, guardOneTimeInput,
   PAYWALL_ENABLED, PLOT_AREA_KEY, CREDIT_PRICE_INR, isAdminUser,
 } from "./entitlementsController.js";
+import {
+  COLLAB_ROLES, OPEN_ACCESS, normaliseCollaborators, collaboratorRole,
+  openAccessOf, isCollaboratorSql,
+} from "../lib/collaborators.js";
+export { COLLAB_ROLES, OPEN_ACCESS, normaliseCollaborators, collaboratorRole, openAccessOf };
 
 // Active editing context used to live in BE/v3/.active-context.json. That
 // file path doesn't work on Vercel (read-only fs), so the active-context
@@ -256,7 +261,7 @@ export async function listTemplates(_req, res) {
   const sql = getSql();
   const rows = await sql.unsafe(`
     SELECT id, name, scheme, description, legacy_template_id,
-           published_version_id, ord, disabled, created_at, updated_at
+           published_version_id, ord, disabled, hidden, created_at, updated_at
     FROM ${T.v3_templates}
     ORDER BY ord ASC, created_at DESC
     LIMIT 500
@@ -379,6 +384,9 @@ export async function patchTemplate(req, res) {
     ["input_sections", "input_sections"],
     ["branding", "branding"],
     ["disabled", "disabled"],
+    // Separate from `disabled`: hidden keeps a template fully usable but out of
+    // listings, where disabled switches it off entirely.
+    ["hidden", "hidden"],
     ["ord", "ord"],
     // Persisted pointer to the version the editor currently has open (the
     // "active editing version"). The published version is locked; any other
@@ -3533,12 +3541,7 @@ export async function listInstances(req, res) {
        LEFT JOIN ${T.v3_templates} t ON t.id = i.template_id
        WHERE $1::text IS NULL
           OR i.user_id::text = $1::text
-          OR EXISTS (
-               SELECT 1 FROM jsonb_array_elements_text(
-                 CASE WHEN jsonb_typeof(i.collaborators) = 'array'
-                      THEN i.collaborators ELSE '[]'::jsonb END
-               ) AS collab(uid) WHERE collab.uid = $1::text
-             )
+          OR ${isCollaboratorSql("i.collaborators", "$1::text")}
        ORDER BY i.created_at DESC
        LIMIT 500`,
       [userId],
@@ -3576,25 +3579,58 @@ function requesterId(req) {
   return b.user_id ?? b.userid ?? null;
 }
 
-// Edit-permission gate for an instance. The owner (v3_instances.user_id) or any
-// listed collaborator may write; everyone else (incl. anonymous) is rejected with
-// 403 — but ONLY once the instance has an owner set. Legacy owner-less instances
-// stay open for backward compatibility (same rule as direct feasibilities).
+// ── who may do what ─────────────────────────────────────────────────────────
+// The open_access column is created on first use rather than relied upon from
+// ensureTables, because ENSURE_TABLES is off on some boxes (this is the same
+// reason ensureVerForkCol and ensureMiImportColumns exist). Without this, the
+// SELECT below would throw on a database that has not been migrated and every
+// instance write would start failing.
+let _openAccessColEnsured = false;
+async function ensureOpenAccessCol(sql) {
+  if (_openAccessColEnsured) return;
+  try {
+    await sql.unsafe(`ALTER TABLE ${T.v3_instances} ADD COLUMN IF NOT EXISTS open_access TEXT NOT NULL DEFAULT 'off'`);
+    await sql.unsafe(`ALTER TABLE ${T.reports} ADD COLUMN IF NOT EXISTS open_access TEXT NOT NULL DEFAULT 'off'`);
+    _openAccessColEnsured = true;
+  } catch (e) {
+    console.error("[ensureOpenAccessCol]", e?.message || e);
+  }
+}
+
+// The rules themselves live in v3/lib/collaborators.js — see the import above.
+
+// Edit-permission gate for an instance. Writing is allowed to the owner
+// (v3_instances.user_id), to a collaborator whose role is "edit", and to anyone
+// at all when the instance is opened to all with edit rights. Everyone else is
+// rejected with 403 — but ONLY once the instance has an owner set. Legacy
+// owner-less instances stay open for backward compatibility (same rule as direct
+// feasibilities).
+//
+// Reading is NOT gated here, and is not gated anywhere else either: anyone with
+// the link can already open any instance. So a "view" collaborator is a listed
+// person who is explicitly NOT an editor, rather than someone being granted
+// something they lacked.
 async function checkInstancePermission(sql, instanceId, userid) {
+  await ensureOpenAccessCol(sql);
   const [inst] = await sql.unsafe(
-    `SELECT id, user_id, collaborators FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`,
+    `SELECT id, user_id, collaborators, open_access FROM ${T.v3_instances} WHERE id = $1 LIMIT 1`,
     [instanceId],
   );
   if (!inst) return { ok: false, status: 404, error: "Instance not found" };
   const owner = inst.user_id;
-  const collabs = Array.isArray(inst.collaborators) ? inst.collaborators : [];
   const uid = userid == null ? null : String(userid);
   const isOwner = !!(owner && uid && String(owner) === uid);
-  const isCollaborator = !!(uid && collabs.some((c) => String(c) === uid));
-  if (owner && !isOwner && !isCollaborator) {
-    return { ok: false, status: 403, error: "You are not authorized to edit this instance.", inst };
+  const role = collaboratorRole(inst.collaborators, uid);
+  const open = openAccessOf(inst);
+  const mayEdit = isOwner || role === "edit" || open === "edit";
+
+  if (owner && !mayEdit) {
+    const why = role === "view"
+      ? "You have view-only access to this instance."
+      : "You are not authorized to edit this instance.";
+    return { ok: false, status: 403, error: why, inst };
   }
-  return { ok: true, inst, isOwner, isCollaborator };
+  return { ok: true, inst, isOwner, role, openAccess: open, isCollaborator: role != null };
 }
 
 export async function createInstance(req, res) {
@@ -4008,6 +4044,8 @@ export async function patchInstance(req, res) {
   const fields = [
     ["name", "name"],
     ["collaborators", "collaborators"],
+    // "off" | "view" | "edit" — what someone who is NOT listed may do.
+    ["open_access", "open_access"],
     ["print_overrides", "print_overrides"],
     // Per-group preset mode chosen in THIS report (auto | free | <presetId>).
     ["preset_selections", "preset_selections"],
@@ -4018,11 +4056,17 @@ export async function patchInstance(req, res) {
   for (const [col, key] of fields) {
     if (Object.prototype.hasOwnProperty.call(b, key)) {
       sets.push(`"${col}" = $${i}`);
-      // De-duplicate + trim collaborator strings as a safety belt.
+      // Accept both shapes on the wire — a bare id or { id, role } — and store
+      // the normalised { id, role } form. De-duplication comes with it.
       if (key === "collaborators") {
-        const arr = Array.isArray(b[key]) ? b[key] : [];
-        const cleaned = [...new Set(arr.map((s) => String(s).trim()).filter(Boolean))];
-        params.push(cleaned);
+        // The array goes over as-is: postgres.js JSON-encodes it for the jsonb
+        // column. Pre-stringifying double-encodes it into a jsonb *string*,
+        // which makes jsonb_typeof 'string' and hides the row from every
+        // collaborator lookup. See v3/lib/collaborators.js.
+        params.push(normaliseCollaborators(b[key]));
+      } else if (key === "open_access") {
+        // Anything unrecognised closes the door rather than opening it.
+        params.push(OPEN_ACCESS.has(b[key]) ? b[key] : "off");
       } else {
         params.push(b[key]);
       }
@@ -6346,24 +6390,37 @@ async function buildReportView(sql, instanceIds) {
   return { columns: lightColumns, alignment };
 }
 
+// DELETE-then-INSERT, so it MUST be atomic. Two of these running at once (a
+// double-fired save, a retry) used to interleave — both deleted, then the second
+// hit the (report_id, instance_id) unique key and died halfway, leaving the
+// project holding a fraction of its reports. Worse, ensureInstancesHomed then
+// re-homed the "dropped" ones into a pile of new single-report projects. The
+// transaction makes the rewrite all-or-nothing and ON CONFLICT makes a racing
+// insert a no-op instead of a 500.
 async function replaceReportInstances(sql, reportId, instanceIds) {
-  // Remember who was in here before the rewrite so anything dropped can be
-  // re-homed instead of silently becoming an orphan report.
-  const previous = await sql.unsafe(
-    `SELECT instance_id FROM ${T.report_instances} WHERE report_id = $1`, [reportId]);
-  await sql.unsafe(`DELETE FROM ${T.report_instances} WHERE report_id = $1`, [reportId]);
-  const seen = new Set();
-  let ord = 0;
-  for (const raw of instanceIds || []) {
-    const iid = String(raw || "").trim();
-    if (!iid || seen.has(iid)) continue;
-    seen.add(iid);
-    await sql.unsafe(
-      `INSERT INTO ${T.report_instances} (id, report_id, instance_id, ord) VALUES ($1,$2,$3,$4)`,
-      [newObjectId(), reportId, iid, ord++],
-    );
-  }
-  const dropped = previous.map((r) => r.instance_id).filter((iid) => !seen.has(iid));
+  let dropped = [];
+  await sql.begin(async (tx) => {
+    // Remember who was in here before the rewrite so anything dropped can be
+    // re-homed instead of silently becoming an orphan report.
+    const previous = await tx.unsafe(
+      `SELECT instance_id FROM ${T.report_instances} WHERE report_id = $1`, [reportId]);
+    await tx.unsafe(`DELETE FROM ${T.report_instances} WHERE report_id = $1`, [reportId]);
+    const seen = new Set();
+    let ord = 0;
+    for (const raw of instanceIds || []) {
+      const iid = String(raw || "").trim();
+      if (!iid || seen.has(iid)) continue;
+      seen.add(iid);
+      await tx.unsafe(
+        `INSERT INTO ${T.report_instances} (id, report_id, instance_id, ord) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (report_id, instance_id) DO UPDATE SET ord = EXCLUDED.ord`,
+        [newObjectId(), reportId, iid, ord++],
+      );
+    }
+    dropped = previous.map((r) => r.instance_id).filter((iid) => !seen.has(iid));
+  });
+  // Outside the transaction on purpose: this CREATES projects, and it must not
+  // do so on behalf of a rewrite that ended up rolling back.
   if (dropped.length) await ensureInstancesHomed(sql, dropped);
 }
 
@@ -6391,7 +6448,7 @@ async function ensureInstancesHomed(sql, instanceIds) {
       await sql.unsafe(
         `INSERT INTO ${T.reports} (id, name, user_id, collaborators) VALUES ($1,$2,$3,$4::jsonb)`,
         [pid, inst.name || null, inst.user_id || null,
-         JSON.stringify(parseJsonbStr(inst.collaborators, []))],
+         parseJsonbStr(inst.collaborators, [])],
       );
       await sql.unsafe(
         `INSERT INTO ${T.report_instances} (id, report_id, instance_id, ord) VALUES ($1,$2,$3,0)
@@ -6476,20 +6533,12 @@ export async function listReports(req, res) {
          FROM ${T.reports} r
         WHERE $1::text IS NULL
            OR r.user_id::text = $1::text
-           OR EXISTS (
-                SELECT 1 FROM jsonb_array_elements_text(
-                  CASE WHEN jsonb_typeof(r.collaborators) = 'array'
-                       THEN r.collaborators ELSE '[]'::jsonb END
-                ) AS c(uid) WHERE c.uid = $1::text)
+           OR ${isCollaboratorSql("r.collaborators", "$1::text")}
            OR EXISTS (
                 SELECT 1 FROM ${T.report_instances} ri
                   JOIN ${T.v3_instances} i ON i.id = ri.instance_id
                  WHERE ri.report_id = r.id
-                   AND EXISTS (
-                     SELECT 1 FROM jsonb_array_elements_text(
-                       CASE WHEN jsonb_typeof(i.collaborators) = 'array'
-                            THEN i.collaborators ELSE '[]'::jsonb END
-                     ) AS c2(uid) WHERE c2.uid = $1::text))
+                   AND ${isCollaboratorSql("i.collaborators", "$1::text")})
         ORDER BY r.updated_at DESC
         LIMIT 1000`,
       [uid],
@@ -6511,12 +6560,10 @@ export async function createReport(req, res) {
   try {
     await ensureReportTables();
     const id = newObjectId();
-    const collabs = Array.isArray(b.collaborators)
-      ? [...new Set(b.collaborators.map((x) => String(x || "").trim()).filter(Boolean))]
-      : [];
+    const collabs = normaliseCollaborators(b.collaborators);
     await sql.unsafe(
       `INSERT INTO ${T.reports} (id, name, user_id, collaborators) VALUES ($1,$2,$3,$4::jsonb)`,
-      [id, b.name ? String(b.name) : null, b.user_id ? String(b.user_id) : (requesterId(req) || null), JSON.stringify(collabs)],
+      [id, b.name ? String(b.name) : null, b.user_id ? String(b.user_id) : (requesterId(req) || null), collabs],
     );
     await replaceReportInstances(sql, id, instanceIds);
     const [row] = await sql.unsafe(`SELECT * FROM ${T.reports} WHERE id = $1 LIMIT 1`, [id]);
@@ -6544,7 +6591,7 @@ export async function getReport(req, res) {
   }
 }
 
-// PATCH /v3/reports/:id — { name?, instance_ids? }
+// PATCH /v3/reports/:id — { name?, instance_ids?, collaborators?, open_access? }
 export async function patchReport(req, res) {
   const sql = getSql();
   const b = req.body || {};
@@ -6559,20 +6606,36 @@ export async function patchReport(req, res) {
     // Project-level sharing: full-array replace, same normalization as
     // patchInstance. Only the owner may change who a project is shared with —
     // otherwise a collaborator could remove the owner or re-share it onward.
-    if (Array.isArray(b.collaborators)) {
+    if (Array.isArray(b.collaborators) || b.open_access !== undefined) {
       const requester = requesterId(req);
       if (row.user_id && requester && String(row.user_id) !== String(requester)) {
         return res.status(403).json({ error: "Only the project owner can change sharing." });
       }
-      const list = [...new Set(b.collaborators.map((x) => String(x || "").trim()).filter(Boolean))];
-      await sql.unsafe(
-        `UPDATE ${T.reports} SET collaborators = $1::jsonb, updated_at = NOW() WHERE id = $2`,
-        [JSON.stringify(list), req.params.id],
-      );
+      await ensureOpenAccessCol(sql);
+      if (Array.isArray(b.collaborators)) {
+        await sql.unsafe(
+          `UPDATE ${T.reports} SET collaborators = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+          [normaliseCollaborators(b.collaborators), req.params.id],
+        );
+      }
+      if (b.open_access !== undefined) {
+        await sql.unsafe(
+          `UPDATE ${T.reports} SET open_access = $1, updated_at = NOW() WHERE id = $2`,
+          [OPEN_ACCESS.has(b.open_access) ? b.open_access : "off", req.params.id],
+        );
+      }
     }
     if (Array.isArray(b.instance_ids)) {
       const ids = normalizeInstanceIds(b.instance_ids);
-      if (ids.length > MAX_REPORT_INSTANCES) {
+      // The cap is about how many reports may be ADDED to a project, not about
+      // shuffling the ones already in it. Projects bigger than the cap exist
+      // (they predate it, and copies can outgrow it), and enforcing the cap on
+      // every write meant that on those projects EVERY reorder came back 400 —
+      // which the front end threw away, so the new order lived only until the
+      // next reload. Only a write that brings in a new member is capped.
+      const existing = new Set(await reportInstanceIds(sql, req.params.id));
+      const incoming = ids.filter((x) => !existing.has(x));
+      if (incoming.length > 0 && ids.length > MAX_REPORT_INSTANCES) {
         return res.status(400).json({ error: `a report can hold at most ${MAX_REPORT_INSTANCES} instances` });
       }
       await replaceReportInstances(sql, req.params.id, ids);

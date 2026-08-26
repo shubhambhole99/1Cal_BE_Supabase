@@ -617,6 +617,13 @@ export async function ensureTables() {
       `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS collaborators JSONB DEFAULT '[]'::jsonb`,
       // Project-level sharing (v3_reports = the project wrapping N reports).
       `ALTER TABLE ${ref("v3_reports")} ADD COLUMN IF NOT EXISTS collaborators JSONB DEFAULT '[]'::jsonb`,
+      // What someone who is NOT listed as a collaborator may do: "off" (the
+      // default, and what every existing row gets), "view", or "edit". It is a
+      // shortcut for the common case where the owner does not want to name each
+      // person. Defaulting to "off" means shipping this changes nothing until
+      // somebody deliberately opens a report.
+      `ALTER TABLE ${ref("v3_instances")} ADD COLUMN IF NOT EXISTS open_access TEXT NOT NULL DEFAULT 'off'`,
+      `ALTER TABLE ${ref("v3_reports")} ADD COLUMN IF NOT EXISTS open_access TEXT NOT NULL DEFAULT 'off'`,
       `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS schemes JSONB DEFAULT '[]'::jsonb`,
       `ALTER TABLE ${ref("v3_pages")} ADD COLUMN IF NOT EXISTS row_heights JSONB DEFAULT '{}'::jsonb`,
       // Per-page freeze panes (count of frozen top rows / left columns). Server-
