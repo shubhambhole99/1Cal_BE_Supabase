@@ -6186,6 +6186,13 @@ function ensureReportTables() {
     // comparison reloads next time the project opens. Self-migrated here for the
     // same reason as collaborators (ENSURE_TABLES=false boxes never run ensureTables).
     .then(() => sql.unsafe(`ALTER TABLE ${T.reports} ADD COLUMN IF NOT EXISTS compare_layout JSONB DEFAULT '{}'::jsonb`))
+    // State for the Special tools, keyed by tool id: { "tenant-33-7": {...} }.
+    // Held on the PROJECT, not on any one report — a tenant schedule describes
+    // the building being redeveloped, so every calculation in the project shares
+    // the one list rather than each carrying its own copy.
+    .then(() => sql.unsafe(`ALTER TABLE ${T.reports} ADD COLUMN IF NOT EXISTS tools JSONB DEFAULT '{}'::jsonb`))
+    .then(() => sql.unsafe(`ALTER TABLE ${T.reports} ALTER COLUMN tools SET DEFAULT '{}'::jsonb`))
+    .then(() => sql.unsafe(`UPDATE ${T.reports} SET tools = '{}'::jsonb WHERE jsonb_typeof(tools) <> 'object'`))
     .then(() => sql.unsafe(`CREATE TABLE IF NOT EXISTS ${T.report_instances} (
         id VARCHAR(24) PRIMARY KEY, report_id VARCHAR(24) NOT NULL,
         instance_id VARCHAR(24) NOT NULL, ord INTEGER NOT NULL DEFAULT 0, col_label TEXT,
@@ -6643,6 +6650,13 @@ export async function patchReport(req, res) {
     }
     // Saved Compare & Combine layout (custom combined columns + active section).
     // Stored verbatim as JSON — the FE owns its shape { cols:[{members:[…]}], section }.
+    // Special-tool state. Bind the object itself — postgres.js already serialises
+    // a JS value into a jsonb parameter, and a JSON.stringify here would encode it
+    // twice, leaving jsonb_typeof 'string' and breaking every read.
+    if (b.tools !== undefined) {
+      await sql.unsafe(`UPDATE ${T.reports} SET tools = $1, updated_at = NOW() WHERE id = $2`,
+        [b.tools && typeof b.tools === "object" && !Array.isArray(b.tools) ? b.tools : {}, req.params.id]);
+    }
     if (b.compare_layout !== undefined) {
       await sql.unsafe(`UPDATE ${T.reports} SET compare_layout = $1::jsonb, updated_at = NOW() WHERE id = $2`,
         [JSON.stringify(b.compare_layout || {}), req.params.id]);
