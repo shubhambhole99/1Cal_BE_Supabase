@@ -3972,8 +3972,11 @@ export async function getInstance(req, res) {
   }
 
   // Versions the viewer may pin this report to (drives the report viewer's
-  // version switcher). Non-admins get only the current published + previously
-  // published (frozen) releases; admins additionally get editable drafts.
+  // version switcher). Without draft access you get only the current published
+  // and previously published (frozen) releases; with it — admin, or the
+  // per-user grant — editable drafts are listed too. This filter is what
+  // actually populates the switcher: gating the other two checks and not this
+  // one leaves a viewer able to see and select a draft that is never offered.
   // (viewerIsAdmin + ensureVerForkCol were already resolved at the top.)
   let switchableVersions = [];
   try {
@@ -3984,7 +3987,7 @@ export async function getInstance(req, res) {
     );
     const publishedId = tpl?.published_version_id || null;
     switchableVersions = allVersions
-      .filter((v) => viewerIsAdmin || v.was_published === true || v.id === publishedId)
+      .filter((v) => viewerSeesDrafts || v.was_published === true || v.id === publishedId)
       .map((v) => ({
         id: v.id,
         label: v.label,
@@ -6294,7 +6297,7 @@ async function composeInstanceColumn(sql, instanceId) {
   // into the multi-report comparison). Pin still gated on pinned_at.
   const versionId = await resolveInstanceVersion(sql, {
     versionPin: inst.version_id, pinnedAt: inst.pinned_at, templateId: inst.template_id,
-    publishedVersionId: tpl?.published_version_id, viewerIsAdmin: false,
+    publishedVersionId: tpl?.published_version_id, viewerSeesDrafts: false,
   });
   const mis = await sql.unsafe(COMPOSE_MI_SELECT, [instanceId, inst.template_id, versionId]);
   await applyCalcPrefill(sql, inst, mis);
