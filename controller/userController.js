@@ -36,6 +36,24 @@ function fetchPhoneData(userJsonUrl) {
   });
 }
 
+// db/ensureTables.js is NOT wired up — its call in app.js is commented out, and
+// ENSURE_TABLES=false besides — so adding a column to schema/users.js does not
+// add it to any database. Drizzle then selects a column that isn't there and
+// every users query 500s, login included. So grant columns self-heal here, the
+// way the v3 controllers do it (see ensureReportTables / ensureInstancePinnedAtCol).
+// Cached: one ALTER per process, idempotent, and a failure retries next request
+// rather than poisoning the cache.
+let _userGrantCols = null;
+export function ensureUserGrantCols() {
+  if (_userGrantCols) return _userGrantCols;
+  const schema = process.env.DB_SCHEMA ?? "final";
+  const ref = schema === "public" ? '"users"' : `"${schema}"."users"`;
+  _userGrantCols = db
+    .execute(sql.raw(`ALTER TABLE ${ref} ADD COLUMN IF NOT EXISTS "can_view_all_versions" boolean DEFAULT false`))
+    .catch((e) => { _userGrantCols = null; throw e; });
+  return _userGrantCols;
+}
+
 function toUserResponse(row) {
   if (!row) return null;
   return {
