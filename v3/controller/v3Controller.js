@@ -5,7 +5,7 @@ import { broadcast } from "../lib/events.js";
 import { verifiedUserId, V3_AUTH_STRICT } from "../middleware/v3Auth.js";
 import {
   canReadLockedPages, entitlementSummary, guardOneTimeInput,
-  PAYWALL_ENABLED, PLOT_AREA_KEY, CREDIT_PRICE_INR, isAdminUser,
+  PAYWALL_ENABLED, PLOT_AREA_KEY, CREDIT_PRICE_INR, isAdminUser, canViewAllVersions,
 } from "./entitlementsController.js";
 import {
   COLLAB_ROLES, OPEN_ACCESS, normaliseCollaborators, collaboratorRole,
@@ -3785,7 +3785,7 @@ function ensureInstancePinnedAtCol(sql) {
 //     everyone else falls back to published, so unreleased content never leaks.
 // Master-input values survive a switch because overrides bind by stable key (see
 // COMPOSE_MI_SELECT), not by version-scoped id.
-async function resolveInstanceVersion(sql, { versionPin, pinnedAt, templateId, publishedVersionId, viewerIsAdmin = false }) {
+async function resolveInstanceVersion(sql, { versionPin, pinnedAt, templateId, publishedVersionId, viewerSeesDrafts = false }) {
   if (versionPin && pinnedAt) {
     const [v] = await sql.unsafe(
       `SELECT id, was_published FROM ${T.v3_versions} WHERE id = $1 AND template_id = $2 LIMIT 1`,
@@ -3793,8 +3793,9 @@ async function resolveInstanceVersion(sql, { versionPin, pinnedAt, templateId, p
     );
     if (v) {
       const isDraft = v.was_published !== true && v.id !== (publishedVersionId || null);
-      if (!isDraft || viewerIsAdmin) return versionPin;
-      // Draft pin + non-admin viewer → never serve unpublished content; use published.
+      if (!isDraft || viewerSeesDrafts) return versionPin;
+      // Draft pin + a viewer without draft access → never serve unpublished
+      // content; fall back to published.
     }
     // A pin pointing at a deleted version falls through to published — never
     // strand a report on a version that no longer exists.
@@ -3817,10 +3818,14 @@ export async function getInstance(req, res) {
     [inst.template_id],
   );
   await ensureVerForkCol(sql);
-  const viewerIsAdmin = await isAdminUser(sql, req, verifiedUserId(req));
+  const viewerId = verifiedUserId(req);
+  const viewerIsAdmin = await isAdminUser(sql, req, viewerId);
+  // Drafts open up for admins and for anyone holding the per-user grant, so a
+  // reviewer can be pointed at an unreleased scheme without admin rights.
+  const viewerSeesDrafts = viewerIsAdmin || (await canViewAllVersions(sql, req, viewerId));
   const versionId = await resolveInstanceVersion(sql, {
     versionPin: inst.version_id, pinnedAt: inst.pinned_at, templateId: inst.template_id,
-    publishedVersionId: tpl?.published_version_id, viewerIsAdmin,
+    publishedVersionId: tpl?.published_version_id, viewerSeesDrafts,
   });
 
   const pages = await sql.unsafe(
@@ -3967,8 +3972,11 @@ export async function getInstance(req, res) {
   }
 
   // Versions the viewer may pin this report to (drives the report viewer's
-  // version switcher). Non-admins get only the current published + previously
-  // published (frozen) releases; admins additionally get editable drafts.
+  // version switcher). Without draft access you get only the current published
+  // and previously published (frozen) releases; with it — admin, or the
+  // per-user grant — editable drafts are listed too. This filter is what
+  // actually populates the switcher: gating the other two checks and not this
+  // one leaves a viewer able to see and select a draft that is never offered.
   // (viewerIsAdmin + ensureVerForkCol were already resolved at the top.)
   let switchableVersions = [];
   try {
@@ -3979,7 +3987,7 @@ export async function getInstance(req, res) {
     );
     const publishedId = tpl?.published_version_id || null;
     switchableVersions = allVersions
-      .filter((v) => viewerIsAdmin || v.was_published === true || v.id === publishedId)
+      .filter((v) => viewerSeesDrafts || v.was_published === true || v.id === publishedId)
       .map((v) => ({
         id: v.id,
         label: v.label,
@@ -4014,6 +4022,9 @@ export async function getInstance(req, res) {
     published_version_id: tpl?.published_version_id || null,
     pinned_version_id: inst.pinned_at ? (inst.version_id || null) : null,
     viewer_is_admin: viewerIsAdmin,
+    // Whether this viewer may see unpublished versions. Admins always can; other
+    // users only with the per-user grant. The version switcher keys off this.
+    viewer_sees_drafts: viewerSeesDrafts,
     // What the viewer is allowed to see, and why — the FE renders its lock
     // overlay and "Change plot area" CTA from this instead of guessing.
     access: {
@@ -4105,6 +4116,11 @@ export async function changeInstanceVersion(req, res) {
   const b = req.body || {};
   const uid = verifiedUserId(req); // token-verified identity only — no body fallback
   const admin = await isAdminUser(sql, req, uid);
+  // Seeing drafts and reaching someone else's report are different powers. The
+  // per-user grant is only the first: the permission check below still stands
+  // for everyone but an admin, so a granted user can switch versions on reports
+  // they can already open, and no others.
+  const seesDrafts = admin || (await canViewAllVersions(sql, req, uid));
   const perm = await checkInstancePermission(sql, id, uid);
   if (!perm.ok && !admin) return res.status(perm.status || 403).json({ error: perm.error || "Not allowed" });
 
@@ -4127,8 +4143,8 @@ export async function changeInstanceVersion(req, res) {
       `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`, [inst.template_id],
     );
     const isDraft = ver.was_published !== true && ver.id !== (tpl?.published_version_id || null);
-    if (isDraft && !admin) {
-      return res.status(403).json({ error: "Only an admin can switch this report to an unpublished draft version." });
+    if (isDraft && !seesDrafts) {
+      return res.status(403).json({ error: "You are not allowed to switch this report to an unpublished draft version." });
     }
     // Refuse a version with no report pages — it would render a blank report.
     const [pc] = await sql.unsafe(
@@ -4286,10 +4302,11 @@ export async function getInstanceMasterInputs(req, res) {
   if (!inst) return res.status(404).json({ error: "Instance not found" });
   // Honour the instance's version pin (gated on pinned_at; drafts admin-only;
   // falls back to published) — see resolveInstanceVersion / getInstance.
-  const viewerIsAdmin = await isAdminUser(sql, req, verifiedUserId(req));
+  const miViewerId = verifiedUserId(req);
+  const miSeesDrafts = await canViewAllVersions(sql, req, miViewerId);
   const miVersionId = await resolveInstanceVersion(sql, {
     versionPin: inst.version_id, pinnedAt: inst.pinned_at, templateId: inst.template_id,
-    publishedVersionId: inst.published_version_id, viewerIsAdmin,
+    publishedVersionId: inst.published_version_id, viewerSeesDrafts: miSeesDrafts,
   });
   const rows = await sql.unsafe(
     `SELECT
@@ -6280,7 +6297,7 @@ async function composeInstanceColumn(sql, instanceId) {
   // into the multi-report comparison). Pin still gated on pinned_at.
   const versionId = await resolveInstanceVersion(sql, {
     versionPin: inst.version_id, pinnedAt: inst.pinned_at, templateId: inst.template_id,
-    publishedVersionId: tpl?.published_version_id, viewerIsAdmin: false,
+    publishedVersionId: tpl?.published_version_id, viewerSeesDrafts: false,
   });
   const mis = await sql.unsafe(COMPOSE_MI_SELECT, [instanceId, inst.template_id, versionId]);
   await applyCalcPrefill(sql, inst, mis);

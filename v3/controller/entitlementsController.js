@@ -54,6 +54,28 @@ export async function isAdminUser(sql, req, userId) {
   } catch { return false; }
 }
 
+/**
+ * May this caller see EVERY version of a template in an instance — unpublished
+ * drafts included — rather than only the published one?
+ *
+ * Admins always may. Past that it is a per-user grant, users.can_view_all_versions,
+ * so a reviewer can be shown a draft scheme without being handed the admin panel
+ * to go with it. It grants visibility of unreleased content and nothing else —
+ * it is not a role, and confers no authority to grant, publish or edit.
+ *
+ * A missing column (a box that has not run ensureTables yet) throws and is
+ * caught, which lands on false: the safe answer is always "published only".
+ */
+export async function canViewAllVersions(sql, req, userId) {
+  if (await isAdminUser(sql, req, userId)) return true;
+  if (!userId) return false;
+  try {
+    const [u] = await sql.unsafe(
+      `SELECT can_view_all_versions FROM ${T.users} WHERE id = $1 LIMIT 1`, [userId]);
+    return u?.can_view_all_versions === true;
+  } catch { return false; }
+}
+
 /** { unlimited, balance, granted, consumed } for a user. */
 export async function entitlementSummary(sql, userId) {
   if (!userId) return { unlimited: false, balance: 0, granted: 0, consumed: 0 };

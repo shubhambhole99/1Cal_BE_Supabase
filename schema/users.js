@@ -15,6 +15,11 @@ export const users = finalSchema.table("users", {
   // Per-user gate: when true, this user sees the "Create Report · V2" button
   // on calculation pages. Hidden for everyone by default; admins grant it per user.
   canCreateV2: boolean("can_create_v2").default(false),
+  // Per-user gate: when true, this user sees EVERY version of a template in an
+  // instance — including unpublished drafts — instead of only the published one.
+  // Separate from role on purpose: it lets someone be shown a draft scheme
+  // without being handed the admin panel with it. Off for everyone by default.
+  canViewAllVersions: boolean("can_view_all_versions").default(false),
   phoneCountryCode: varchar("phone_country_code", { length: 16 }),
   phoneNumber: varchar("phone_number", { length: 32 }),
   firstName: text("first_name"),
