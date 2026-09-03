@@ -12,7 +12,11 @@ export function ensureAboutUsCols() {
   const schema = process.env.DB_SCHEMA ?? "final";
   const ref = schema === "public" ? '"about_us"' : `"${schema}"."about_us"`;
   _aboutUsCols = db
-    .execute(sql.raw(`ALTER TABLE ${ref} ADD COLUMN IF NOT EXISTS "sort_order" integer`))
+    .execute(
+      sql.raw(
+        `ALTER TABLE ${ref} ADD COLUMN IF NOT EXISTS "sort_order" integer, ADD COLUMN IF NOT EXISTS "tag" text`
+      )
+    )
     .catch((e) => {
       _aboutUsCols = null;
       throw e;
@@ -23,10 +27,10 @@ export function ensureAboutUsCols() {
 export async function createAboutUs(req, res) {
   try {
     await ensureAboutUsCols();
-    const { name, brief, description, level, sortOrder } = req.body;
+    const { name, brief, description, level, sortOrder, tag } = req.body;
     const [saved] = await db
       .insert(aboutUs)
-      .values({ id: newObjectId(), name, brief, description, level, sortOrder })
+      .values({ id: newObjectId(), name, brief, description, level, sortOrder, tag })
       .returning();
     if (!saved) return res.status(500).json({ message: "Error creating About Us entry" });
     res.status(201).json(saved);
