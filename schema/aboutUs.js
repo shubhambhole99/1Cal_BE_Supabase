@@ -7,6 +7,7 @@ export const aboutUs = finalSchema.table("about_us", {
   description: text("description").notNull(),
   level: integer("level").notNull(),
   photoUrl: text("photo_url"),
+  sortOrder: integer("sort_order"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   isDisabled: boolean("is_disabled").default(false),
 });

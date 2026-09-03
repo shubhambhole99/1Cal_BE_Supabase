@@ -279,6 +279,7 @@ export async function ensureTables() {
       photo_url: "text",
       created_at: "timestamptz DEFAULT now()",
       is_disabled: "boolean DEFAULT false",
+      sort_order: "integer",
     });
 
     // ── bills ──
