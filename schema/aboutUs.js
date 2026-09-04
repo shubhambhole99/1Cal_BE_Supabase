@@ -4,9 +4,11 @@ export const aboutUs = finalSchema.table("about_us", {
   id: varchar("id", { length: 24 }).primaryKey(),
   name: varchar("name", { length: 256 }).notNull(),
   brief: text("brief").notNull(),
+  tag: text("tag"),
   description: text("description").notNull(),
   level: integer("level").notNull(),
   photoUrl: text("photo_url"),
+  sortOrder: integer("sort_order"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   isDisabled: boolean("is_disabled").default(false),
 });
