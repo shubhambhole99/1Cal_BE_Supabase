@@ -561,6 +561,198 @@ function ensureMiImportColumns() {
   return _miImportColsEnsured;
 }
 
+// Shared core: import master inputs (and the groups they belong to) from a
+// SOURCE template's version into a TARGET (template_id, versionId). Selection by
+// keys[] and/or sections[]. Used by BOTH importMasterInputs (standalone) and
+// importPage (which pulls in the sheet's own inputs so the imported sheet isn't
+// stranded). Behaviour:
+//   • Groups are carried WITH their `presets` (previously dropped on import).
+//   • onConflict "skip" (default) leaves an already-present key untouched — so a
+//     sheet import only adds master inputs that don't already exist here.
+//   • Ref handling (option iii): refs are kept verbatim — one whose page exists
+//     in the destination resolves; one whose page is absent is returned in
+//     `dangling_refs` so the caller/UI can flag it, never silently rebound.
+async function importMasterInputsCore(sql, {
+  template_id, versionId, source_template_id, source_version_id = null,
+  keys = [], sections = [], refPages = [], onConflict = "skip",
+}) {
+  await ensureMiImportColumns();
+  // Resolve the source version (defaults to the source's published version).
+  let srcV = source_version_id || null;
+  if (!srcV) {
+    const [srcT] = await sql.unsafe(
+      `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
+      [source_template_id],
+    );
+    if (!srcT) throw new Error("Source template not found");
+    srcV = srcT.published_version_id || null;
+  }
+  const srcMIs = await sql.unsafe(
+    `SELECT * FROM ${T.master_input}
+      WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)
+      ORDER BY ord ASC`,
+    [source_template_id, srcV],
+  );
+  const srcGroups = await sql.unsafe(
+    `SELECT * FROM ${T.master_input_group}
+      WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
+    [source_template_id, srcV],
+  );
+  const keySet = new Set(keys);
+  const secSet = new Set(sections);
+  const refPageSet = new Set(refPages);
+  // A master input belongs to a page via the page its `ref` targets (e.g.
+  // "Reservation Inputs!F14") — NOT via `section`, which is a logical label that
+  // can differ from the page name (section "Reservations" → page "Reservation
+  // Inputs"). So page-scoped import (importPage) must match on the ref's page.
+  const refPageOf = (ref) => {
+    const mm = /^'?([^'!]+?)'?!/.exec(ref || "");
+    return mm ? mm[1] : null;
+  };
+  const selected = srcMIs.filter((m) => {
+    if (!m.key) return false;
+    if (keySet.has(m.key)) return true;
+    if (m.section && secSet.has(m.section)) return true;
+    if (refPageSet.size) { const rp = refPageOf(m.ref); if (rp && refPageSet.has(rp)) return true; }
+    return false;
+  });
+  if (selected.length === 0) {
+    return { imported_mis: 0, updated_mis: 0, imported_groups: 0, skipped_keys: [], renamed: {}, dangling_refs: [] };
+  }
+  // 1) Remap the groups the selected MIs belong to (carry presets; upsert dedupes
+  //    by (section,key) so re-importing never duplicates a group).
+  const groupById = new Map(srcGroups.map((g) => [g.id, g]));
+  const neededGroupIds = [...new Set(selected.map((m) => m.group_id).filter(Boolean))];
+  const srcGroupToNew = new Map();
+  let importedGroups = 0;
+  if (neededGroupIds.length) {
+    await sql.begin(async (tx) => {
+      for (const gid of neededGroupIds) {
+        const g = groupById.get(gid);
+        if (!g) continue;
+        const newId = newObjectId();
+        // Flag ONLY groups this import creates as imported. A pre-existing group
+        // matching on (section,key) hits DO UPDATE, which never touches
+        // is_imported, so the user's own group keeps its editable styling.
+        // `presets` (raw object → jsonb, no ::jsonb cast → no double-encode).
+        const rows = await tx.unsafe(
+          `INSERT INTO ${T.master_input_group}
+             (id, template_id, version_id, key, display_name, section, ord, presets, is_imported, imported_from)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, true, $9)
+           ON CONFLICT (template_id, version_id, section, key) DO UPDATE
+             SET display_name = EXCLUDED.display_name
+           RETURNING id`,
+          [newId, template_id, versionId, g.key, g.display_name ?? null, g.section ?? null, Number.isFinite(g.ord) ? g.ord : 0, g.presets ?? null, source_template_id],
+        );
+        srcGroupToNew.set(gid, rows[0]?.id || newId);
+        importedGroups++;
+      }
+    });
+  }
+  // 2) Existing target rows. For skip/suffix we only need the key set; for
+  //    "overwrite" we also need the row to update, matched by (section, key) so
+  //    the right one is hit when a key repeats across sections.
+  const existing = await sql.unsafe(
+    `SELECT id, key, section FROM ${T.master_input} WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
+    [template_id, versionId],
+  );
+  const taken = new Set(existing.map((r) => r.key));
+  const existingBySecKey = new Map(existing.map((r) => [`${r.section ?? ""}||${r.key}`, r.id]));
+  // Destination page names — for option (iii) dangling-ref detection.
+  const destPages = await sql.unsafe(
+    `SELECT name FROM ${T.v3_pages} WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
+    [template_id, versionId],
+  );
+  const destPageNames = new Set(destPages.map((p) => p.name));
+  const skippedKeys = [];
+  const renamed = {};
+  const danglingRefs = new Set();
+  const COLS = 17;
+  const insRows = [];
+  const updRows = [];   // {id, m} — existing rows to overwrite in place
+  for (const m of selected) {
+    // Option (iii): keep the ref; flag it if its page isn't in the destination.
+    const rp = refPageOf(m.ref);
+    if (rp && !destPageNames.has(rp)) danglingRefs.add(rp);
+    let key = m.key;
+    if (taken.has(key)) {
+      if (onConflict === "overwrite") {
+        const exId = existingBySecKey.get(`${m.section ?? ""}||${key}`);
+        if (exId) { updRows.push({ id: exId, m }); continue; }
+        // Key exists but in a different section — inserting would create a
+        // duplicate key; skip to stay safe.
+        skippedKeys.push(m.key); continue;
+      }
+      if (onConflict === "skip") { skippedKeys.push(m.key); continue; }
+      let n = 2;
+      while (taken.has(`${m.key}_${n}`)) n++;
+      key = `${m.key}_${n}`;
+      renamed[m.key] = key;
+    }
+    taken.add(key);
+    insRows.push([
+      newObjectId(), template_id, versionId, key, m.display_name ?? null,
+      m.value == null ? null : String(m.value), m.ref ?? null, m.type ?? "text", m.options ?? [],
+      m.section ?? null, m.kind ?? "basic", m.group_id ? (srcGroupToNew.get(m.group_id) ?? null) : null,
+      Number.isFinite(m.ord) ? m.ord : 0,
+      m.default_value == null ? (m.type === "multiselect" ? null : (m.value == null ? null : String(m.value))) : String(m.default_value),
+      // Provenance — flag as imported + record the source template (tooltip).
+      true, source_template_id,
+      m.conditional ?? null,   // raw object - see createMasterInput
+    ]);
+  }
+  // 3) Bulk insert the new MIs (same batched INSERT as bulkCreateMasterInputs).
+  const BATCH = 1000;
+  for (let off = 0; off < insRows.length; off += BATCH) {
+    const slice = insRows.slice(off, off + BATCH);
+    const tuples = slice
+      .map((_, r) => `(${Array.from({ length: COLS }, (_, c) => `$${r * COLS + c + 1}`).join(",")})`)
+      .join(",");
+    await sql.unsafe(
+      `INSERT INTO ${T.master_input}
+         (id, template_id, version_id, key, display_name, value, ref, type, options,
+          section, kind, group_id, ord, default_value, is_imported, imported_from, conditional)
+       VALUES ${tuples}`,
+      slice.flat(),
+    );
+  }
+  // 3b) Overwrite existing rows in place (onConflict "overwrite"): apply the
+  //     source's value/ref/type/options/group/etc. onto the matching dest row,
+  //     keeping its id + key. Provenance flags it as imported.
+  for (const u of updRows) {
+    const m = u.m;
+    await sql.unsafe(
+      `UPDATE ${T.master_input} SET
+         display_name = $1, value = $2, ref = $3, type = $4, options = $5,
+         kind = $6, group_id = $7, ord = $8, default_value = $9,
+         is_imported = true, imported_from = $10, conditional = $11
+       WHERE id = $12`,
+      [
+        m.display_name ?? null,
+        m.value == null ? null : String(m.value),
+        m.ref ?? null,
+        m.type ?? "text",
+        m.options ?? [],
+        m.kind ?? "basic",
+        m.group_id ? (srcGroupToNew.get(m.group_id) ?? null) : null,
+        Number.isFinite(m.ord) ? m.ord : 0,
+        m.default_value == null ? (m.type === "multiselect" ? null : (m.value == null ? null : String(m.value))) : String(m.default_value),
+        source_template_id,
+        m.conditional ?? null,
+        u.id,
+      ],
+    );
+  }
+  return {
+    imported_mis: insRows.length,
+    updated_mis: updRows.length,
+    imported_groups: importedGroups,
+    skipped_keys: skippedKeys,
+    renamed,
+    dangling_refs: [...danglingRefs],
+  };
+}
+
 export async function importMasterInputs(req, res) {
   const sql = getSql();
   const b = req.body || {};
@@ -577,132 +769,31 @@ export async function importMasterInputs(req, res) {
   }
   const onConflict = b.on_conflict === "suffix" ? "suffix" : "skip";
   try {
-    await ensureMiImportColumns();
     const versionId = await resolveVersionId(sql, b.template_id, b.version_id);
     if (!versionId) return res.status(400).json({ error: "Target template has no version yet" });
     if (await isPublishedVersion(sql, b.template_id, versionId)) {
       return res.status(403).json({ error: PUBLISHED_LOCK_MSG });
     }
-    // Resolve the source version (defaults to the source's published version).
-    let srcV = b.source_version_id || null;
-    if (!srcV) {
-      const [srcT] = await sql.unsafe(
-        `SELECT published_version_id FROM ${T.v3_templates} WHERE id = $1 LIMIT 1`,
-        [b.source_template_id],
-      );
-      if (!srcT) return res.status(404).json({ error: "Source template not found" });
-      srcV = srcT.published_version_id || null;
-    }
-    // Read the source MIs + groups, then pick the selection.
-    const srcMIs = await sql.unsafe(
-      `SELECT * FROM ${T.master_input}
-        WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)
-        ORDER BY ord ASC`,
-      [b.source_template_id, srcV],
-    );
-    const srcGroups = await sql.unsafe(
-      `SELECT * FROM ${T.master_input_group}
-        WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
-      [b.source_template_id, srcV],
-    );
-    const keySet = new Set(keys);
-    const secSet = new Set(sections);
-    const selected = srcMIs.filter(
-      (m) => m.key && (keySet.has(m.key) || (m.section && secSet.has(m.section))),
-    );
-    if (selected.length === 0) {
-      return res.json({ imported_mis: 0, imported_groups: 0, skipped_keys: [], renamed: {}, version_id: versionId });
-    }
-    // 1) Remap the groups the selected MIs belong to (upsert dedupes by section::key).
-    const groupById = new Map(srcGroups.map((g) => [g.id, g]));
-    const neededGroupIds = [...new Set(selected.map((m) => m.group_id).filter(Boolean))];
-    const srcGroupToNew = new Map();
-    let importedGroups = 0;
-    if (neededGroupIds.length) {
-      await sql.begin(async (tx) => {
-        for (const gid of neededGroupIds) {
-          const g = groupById.get(gid);
-          if (!g) continue;
-          const newId = newObjectId();
-          // Flag ONLY groups this import actually creates as imported (blue +
-          // locked in the panel). A pre-existing group that matches on
-          // (section,key) hits DO UPDATE, which never touches is_imported, so the
-          // user's own group keeps its normal (editable) styling.
-          const rows = await tx.unsafe(
-            `INSERT INTO ${T.master_input_group}
-               (id, template_id, version_id, key, display_name, section, ord, is_imported, imported_from)
-             VALUES ($1,$2,$3,$4,$5,$6,$7, true, $8)
-             ON CONFLICT (template_id, version_id, section, key) DO UPDATE
-               SET display_name = EXCLUDED.display_name
-             RETURNING id`,
-            [newId, b.template_id, versionId, g.key, g.display_name ?? null, g.section ?? null, Number.isFinite(g.ord) ? g.ord : 0, b.source_template_id],
-          );
-          srcGroupToNew.set(gid, rows[0]?.id || newId);
-          importedGroups++;
-        }
+    const summary = await importMasterInputsCore(sql, {
+      template_id: b.template_id,
+      versionId,
+      source_template_id: b.source_template_id,
+      source_version_id: b.source_version_id || null,
+      keys,
+      sections,
+      onConflict,
+    });
+    if (summary.imported_mis > 0) {
+      broadcast({
+        type: "masterInput.updated",
+        templateId: b.template_id,
+        versionId,
+        reason: "mis.imported",
+        count: summary.imported_mis,
+        clientId: req.get("x-client-id") || null,
       });
     }
-    // 2) Dedupe MI key collisions against the target version's existing keys.
-    const existing = await sql.unsafe(
-      `SELECT key FROM ${T.master_input} WHERE template_id = $1 AND ($2::text IS NULL OR version_id = $2)`,
-      [b.template_id, versionId],
-    );
-    const taken = new Set(existing.map((r) => r.key));
-    const skippedKeys = [];
-    const renamed = {};
-    const COLS = 17;
-    const insRows = [];
-    for (const m of selected) {
-      let key = m.key;
-      if (taken.has(key)) {
-        if (onConflict === "skip") { skippedKeys.push(m.key); continue; }
-        let n = 2;
-        while (taken.has(`${m.key}_${n}`)) n++;
-        key = `${m.key}_${n}`;
-        renamed[m.key] = key;
-      }
-      taken.add(key);
-      insRows.push([
-        newObjectId(), b.template_id, versionId, key, m.display_name ?? null,
-        m.value == null ? null : String(m.value), m.ref ?? null, m.type ?? "text", m.options ?? [],
-        m.section ?? null, m.kind ?? "basic", m.group_id ? (srcGroupToNew.get(m.group_id) ?? null) : null,
-        Number.isFinite(m.ord) ? m.ord : 0,
-        m.default_value == null ? (m.type === "multiselect" ? null : (m.value == null ? null : String(m.value))) : String(m.default_value),
-        // Provenance — flag as imported + record the source template (tooltip).
-        true, b.source_template_id,
-        m.conditional ?? null,   // raw object - see createMasterInput
-      ]);
-    }
-    // 3) Bulk insert the surviving MIs (same batched INSERT as bulkCreateMasterInputs).
-    const BATCH = 1000;
-    for (let off = 0; off < insRows.length; off += BATCH) {
-      const slice = insRows.slice(off, off + BATCH);
-      const tuples = slice
-        .map((_, r) => `(${Array.from({ length: COLS }, (_, c) => `$${r * COLS + c + 1}`).join(",")})`)
-        .join(",");
-      await sql.unsafe(
-        `INSERT INTO ${T.master_input}
-           (id, template_id, version_id, key, display_name, value, ref, type, options,
-            section, kind, group_id, ord, default_value, is_imported, imported_from, conditional)
-         VALUES ${tuples}`,
-        slice.flat(),
-      );
-    }
-    broadcast({
-      type: "masterInput.updated",
-      templateId: b.template_id,
-      versionId,
-      reason: "mis.imported",
-      count: insRows.length,
-      clientId: req.get("x-client-id") || null,
-    });
-    res.status(201).json({
-      imported_mis: insRows.length,
-      imported_groups: importedGroups,
-      skipped_keys: skippedKeys,
-      renamed,
-      version_id: versionId,
-    });
+    res.status(201).json({ ...summary, version_id: versionId });
   } catch (e) {
     console.error("[importMasterInputs] error:", e?.message || e);
     res.status(500).json({ error: String(e?.message || e) });
@@ -1212,6 +1303,39 @@ export async function importPage(req, res) {
       [b.template_id, name, b.source_template_id, b.source_page_name],
     );
 
+    // Bring the sheet's own master inputs (and their groups) so its input-driven
+    // cells aren't stranded in the destination. Only add keys that don't already
+    // exist here ("import if it does not exist"). Because the sheet is imported
+    // under the same name, its inputs' refs (e.g. `Sheet!D27`) resolve to it, so
+    // the link isn't broken; any ref to a page not present is flagged as dangling.
+    let miSummary = { imported_mis: 0, updated_mis: 0, imported_groups: 0, skipped_keys: [], renamed: {}, dangling_refs: [] };
+    try {
+      miSummary = await importMasterInputsCore(sql, {
+        template_id: b.template_id,
+        versionId,
+        source_template_id: b.source_template_id,
+        source_version_id: null,
+        // Match the sheet's inputs by the page their `ref` targets (robust when
+        // the MI section label differs from the page name, e.g. Reservations),
+        // plus section==name as a fallback for pages where they coincide.
+        refPages: [b.source_page_name],
+        sections: [b.source_page_name],
+        onConflict: "skip",
+      });
+      if (miSummary.imported_mis > 0) {
+        broadcast({
+          type: "masterInput.updated",
+          templateId: b.template_id,
+          versionId,
+          reason: "mis.imported.with_page",
+          count: miSummary.imported_mis,
+          clientId: req.get("x-client-id") || null,
+        });
+      }
+    } catch (miErr) {
+      console.error("[importPage] master-input import failed:", miErr?.message || miErr);
+    }
+
     const [page] = await sql.unsafe(`SELECT * FROM ${T.v3_pages} WHERE id = $1 LIMIT 1`, [pid]);
     broadcast({
       type: "page.created",
@@ -1230,6 +1354,7 @@ export async function importPage(req, res) {
         source_template_id: b.source_template_id,
         source_page_name: b.source_page_name,
       },
+      master_inputs: miSummary,
     });
   } catch (e) {
     console.error("[importPage] error:", e?.message || e);
